@@ -281,10 +281,11 @@ class DoomModel(tf.keras.Model):
         expects = tf.reshape(expects,[expects.shape[0],1,N_MEASUREMENTS,N_GOAL_TIMES])
         expects = tf.broadcast_to(expects, acts.shape)
         
-        #TODO: add measurements to the total too!
-        #      that way we're only predicting the change, not the actual measurements.
-        
         total = tf.add(acts,expects)
+
+        if PREDICT_ONLY_DELTAS:
+            total = tf.add(total,tf.expand_dims(tf.expand_dims(measurements,axis=1),axis=-1))
+
         return total
 
 class Memories:
