@@ -130,3 +130,5 @@ dmypy.json
 
 # my own stuff
 *.log.txt
+_vizdoom.ini
+DOOM.WAD

@@ -96,6 +96,7 @@ action_list = Actions([[vzd.Button.MOVE_LEFT,vzd.Button.MOVE_RIGHT],[vzd.Button.
 EPISODE_LENGTH = 180*35
 USE_DEPTH_BUFFER = True
 USE_LABELED_RECTS = True
+PREDICT_ONLY_DELTAS = True
 
 TOPK = 16 #only used with the choose_topk function
 
@@ -326,13 +327,11 @@ class Memories:
 dm = DoomModel(sys.argv[1])
 memories = Memories(memory_size=MEMORY_SIZE)
 
-PRINTTIME = 64
-
 game = vzd.DoomGame()
 init(game,vzd.Mode.PLAYER)
 
+#TODO: implement learning rate schedule
 optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4, beta_1=0.95, beta_2=0.999, epsilon=1e-4)
-
 
 @tf.function
 def train_func(screen_buf,gamevars,goal,actions,targets):
@@ -518,6 +517,9 @@ while True:
         starttime = time.time()
         with open("training_"+sys.argv[1]+".log.txt","a") as file:
            file.write("{0} {1} {2}\n".format(states, [x(game, state) for x in MEAS], test_states_seen))
+           
+        #TODO: implement model saving!
+
 
 game.close()
 
@@ -529,10 +531,6 @@ or maybe visited blockmap blocks?
 or maybe seen linedefs?
 
 or all of the above! :D
-
-TODO:
-learning rate schedule!
-model saving!
 
 IDEAS:
 do X, something should happen, but it doesnt happen. this should ring alarm bells with the bot.
