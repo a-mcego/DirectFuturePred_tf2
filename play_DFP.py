@@ -7,102 +7,19 @@ import time
 import numpy as np
 import sys
 import cv2
-from enum import Enum
 
 if len(sys.argv) != 2:
     print("Give model savefile as argument.")
     exit(0)
 
-class RandomChoiceType(Enum):
-    UNIFORM = 1
-    SOFTMAX = 2
-    
-class TrainingType(Enum):
-    EXPERIENCE_REPLAY = 1
-    FULL_EPISODES = 2
-    
-#helper class for actions
-class Actions:
-    def __init__(self, actions):
-        self.actions = actions
-        self.total=1
-        self.flattened = []
-        self.groups = []
-        for group in self.actions:
-            self.total *= len(group)+1
-            for act in group:
-                self.flattened.append(act)
-        
-    def number_to_vector(self, n):
-        ret = []
-        for group in self.actions:
-            length = len(group)+1
-            value = n%length
-            n //= length
-            added = [0.0]*(length-1)
-            if value>0:
-                added[value-1] = 1.0
-            ret.extend(added)
-        return ret
-
-
-def get_nth_var(n):
-    def h(game,state):
-        return state.game_variables[n]
-    return h
-
-damage_first_time = True
-damage_total_health = 0.0
-def get_damagecount(game,state):
-    global damage_first_time
-    global damage_total_health
-    if damage_first_time:
-        damage_first_time = False
-        damage_total_health = 0.0
-        for obj in state.objects:
-            if obj.is_sentient > 0.5 and obj.name != 'DoomPlayer':
-                damage_total_health += obj.health
-    total_health = 0.0
-    for obj in state.objects:
-        if obj.is_sentient > 0.5 and obj.name != 'DoomPlayer':
-            total_health += obj.health
-    return damage_total_health - total_health
-
-def get_deadness(game,state):
-    return float(game.is_player_dead())
+from DFP_helpers import *
 
 #---START---USER-SUPPLIED-SETTINGS---
 
-#Scenario 1 from the Direct Future Prediction paper
-"""WAD_NAME = "d1_basic.wad"
-MAP_NAME = "map01"
-VIZDOOM_VARS = [vzd.GameVariable.HEALTH]
-MEAS = [get_nth_var(0)]
-MEAS_PREPROCESS_COEFS = [0.01]
-GOAL_MEAS_COEFS = [1.]
-action_list = Actions([[vzd.Button.MOVE_FORWARD],[vzd.Button.TURN_LEFT],[vzd.Button.TURN_RIGHT]])
-EPISODE_LENGTH = 60*35
-USE_DEPTH_BUFFER = False
-USE_LABELED_RECTS = False"""
+#from d1_basic import *
+from playdoom import *
 
-#Scenario: Just playing Doom 1 map E1M2.
-WAD_NAME = "doom.wad"
-MAP_NAME = "e1m2"
-MEAS = [get_nth_var(0),get_nth_var(1),get_nth_var(2), get_damagecount, get_deadness]
-VIZDOOM_VARS = [vzd.GameVariable.HEALTH, vzd.GameVariable.ARMOR, vzd.GameVariable.SECRETCOUNT]
-MEAS_PREPROCESS_COEFS = [0.01,0.01,1.0,0.02,2.0]
-GOAL_MEAS_COEFS = [1.,1.,1.,1.,-1.]
-action_list = Actions([[vzd.Button.MOVE_LEFT,vzd.Button.MOVE_RIGHT],[vzd.Button.MOVE_FORWARD,vzd.Button.MOVE_BACKWARD],[vzd.Button.TURN_LEFT,vzd.Button.TURN_RIGHT],[vzd.Button.SPEED],[vzd.Button.ATTACK,vzd.Button.USE,vzd.Button.SELECT_WEAPON1,vzd.Button.SELECT_WEAPON2,vzd.Button.SELECT_WEAPON3,vzd.Button.SELECT_WEAPON4]])
-EPISODE_LENGTH = 180*35
-USE_DEPTH_BUFFER = True
-USE_LABELED_RECTS = True
 PREDICT_ONLY_DELTAS = True
-
-TOPK = 16 #only used with the choose_topk function
-
-GOAL_TIMES = [1,2,4,8,16,32,64]
-GOAL_TEMPORAL_COEFS = [0.2, 0.2, 0.2, 0.5, 0.5, 1., 1.]
-N_GOAL_TIMES = len(GOAL_TIMES)
 
 IMG_SIZE = 84
 
@@ -125,6 +42,7 @@ USE_GOAL_INPUT = False
 
 #---END---USER-SUPPLIED-SETTINGS---
 
+N_GOAL_TIMES = len(GOAL_TIMES)
 MEAS_POSTPROCESS_COEFS = [1.0/x for x in MEAS_PREPROCESS_COEFS]
 N_MEASUREMENTS = len(MEAS)
 N_ACTIONS = action_list.total
@@ -139,33 +57,6 @@ GOAL_MEAS_COEFS = tf.convert_to_tensor(GOAL_MEAS_COEFS,dtype=tf.float32)
 MEAS_PREPROCESS_COEFS = tf.convert_to_tensor(MEAS_PREPROCESS_COEFS,dtype=tf.float32)
 MEAS_POSTPROCESS_COEFS = tf.convert_to_tensor(MEAS_POSTPROCESS_COEFS,dtype=tf.float32)
 
-#choose index from probabilities:
-def choose_topk(vec,TOPK):
-    vec = tf.reshape(vec,[-1])
-    veclen = vec.shape[-1]
-    
-    sm = tf.math.exp(vec)
-    
-    #these 3 lines set any probability less than 1/length to zero
-    limit = tf.reduce_sum(sm)/tf.cast(veclen,tf.float32)
-    mask = tf.cast(tf.greater(sm,limit),tf.float32)
-    sm = tf.multiply(sm,mask)
-
-    tops = tf.math.top_k(sm,TOPK)
-    cum_sm = tf.math.cumsum(tops.values)
-    point = tf.random.uniform([],0.0,tf.reduce_sum(tops.values))
-    chosen = tf.reduce_sum(tf.cast(tf.math.less(cum_sm,point),tf.int32))
-    chosen = tops.indices[chosen]
-    return chosen
-    
-def choose(vec):
-    vec = tf.reshape(vec,[-1])
-    veclen = vec.shape[-1]
-    sm = tf.math.exp(vec)
-    cum_sm = tf.math.cumsum(sm)
-    point = tf.random.uniform([],0.0,tf.reduce_sum(sm))
-    chosen = tf.cast(tf.reduce_sum(tf.cast(tf.math.less(cum_sm,point),tf.int32)),tf.int32)
-    return chosen
 
 def init(game,mode):
     game.set_doom_scenario_path(WAD_NAME)
@@ -208,19 +99,7 @@ def init(game,mode):
     game.set_mode(mode)
     game.init()
     
-class DeltaTracker:
-    def set_delta(self, current):
-        try:
-            self.delta = current-self.prev
-            self.prev = current
-            return self.delta
-        except AttributeError:
-            self.prev = current
-            self.delta = 0
-            return 0
-    
-    def last_delta(self):
-        return self.delta
+
 
 class DoomModel(tf.keras.Model):
     def __init__(self, filename):
