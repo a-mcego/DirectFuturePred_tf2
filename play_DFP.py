@@ -29,13 +29,13 @@ TRAINING_TYPE = TrainingType.EXPERIENCE_REPLAY
 #TRAINING_TYPE = TrainingType.FULL_EPISODES
 #TODO: add padding to FULL_EPISODES mode so TF doesn't rebuild the graph every time
 
-#MEMORY_FULL_STRATEGY = MemoryFullStrategy.DELETE_OLD
-MEMORY_FULL_STRATEGY = MemoryFullStrategy.DELETE_EVERY_OTHER
-
 FRAMESKIP = 4
 BATCH_SIZE = 64 #how many steps in one batch of training the network
 MEMORY_SIZE = 20000 #how many steps we keep in the experience memory
 TEST_FREQUENCY = 2500 #how often we test the network, in steps trained
+
+#MEMORY_FULL_STRATEGY = MemoryFullStrategy.DELETE_OLD
+MEMORY_FULL_STRATEGY = MemoryFullStrategy.DELETE_EVERY_OTHER
 
 #having goal as an input to the network seems to be unnecessary.
 #here's a way to turn it off! :)
@@ -73,8 +73,12 @@ def init(game,mode):
     else:
         print("Game resolution", GAME_RESOLUTION, "not supported")
 
-    #game.set_screen_format(vzd.ScreenFormat.RGB24)
-    game.set_screen_format(vzd.ScreenFormat.GRAY8)
+    if COLORMODE == ColorMode.GRAYSCALE:
+        game.set_screen_format(vzd.ScreenFormat.GRAY8)
+    elif COLORMODE == ColorMode.COLOR:
+        game.set_screen_format(vzd.ScreenFormat.RGB24)
+    else:
+        print("Color mode",repr(COLORMODE),"not supported.")
     game.set_depth_buffer_enabled(USE_DEPTH_BUFFER)
     game.set_labels_buffer_enabled(USE_LABELED_RECTS)
     game.set_automap_buffer_enabled(False)
@@ -266,10 +270,14 @@ while True:
     goal = tf.expand_dims(tf.einsum("a,b->ab",GOAL_MEAS_COEFS,GOAL_TEMPORAL_COEFS),axis=0)
     while not game.is_episode_finished():
         state = game.get_state()
+
         screen_buf = state.screen_buffer
         screen_buf = cv2.resize(screen_buf, (SCALED_RESOLUTION[1],SCALED_RESOLUTION[0]))
         screen_buf = tf.add(tf.multiply(tf.cast(screen_buf,tf.float32),1.0/255.0),-0.5)
-        screen_buf = tf.reshape(screen_buf,[1,screen_buf.shape[0],screen_buf.shape[1],1])
+        if COLORMODE == ColorMode.GRAYSCALE:
+            screen_buf = tf.reshape(screen_buf,[1,screen_buf.shape[0],screen_buf.shape[1],1])
+        elif COLORMODE == ColorMode.COLOR:
+            screen_buf = tf.reshape(screen_buf,[1,screen_buf.shape[0],screen_buf.shape[1],3])
         
         if USE_DEPTH_BUFFER:
             depth_buf = state.depth_buffer
@@ -371,12 +379,15 @@ while True:
         test_states_seen = 0
         while not game.is_episode_finished():
             state = game.get_state()
+            
             screen_buf = state.screen_buffer
-            #TODO: make it support RGB as well.
             screen_buf = cv2.resize(screen_buf, (SCALED_RESOLUTION[1],SCALED_RESOLUTION[0]))
             screen_buf = tf.add(tf.multiply(tf.cast(screen_buf,tf.float32),1.0/255.0),-0.5)
-            screen_buf = tf.reshape(screen_buf,[1,screen_buf.shape[0],screen_buf.shape[1],1])
-
+            if COLORMODE == ColorMode.GRAYSCALE:
+                screen_buf = tf.reshape(screen_buf,[1,screen_buf.shape[0],screen_buf.shape[1],1])
+            elif COLORMODE == ColorMode.COLOR:
+                screen_buf = tf.reshape(screen_buf,[1,screen_buf.shape[0],screen_buf.shape[1],3])
+            
             if USE_DEPTH_BUFFER:
                 depth_buf = state.depth_buffer
                 depth_buf = cv2.resize(depth_buf, (SCALED_RESOLUTION[1],SCALED_RESOLUTION[0]))
@@ -415,7 +426,6 @@ while True:
         with open("training_"+sys.argv[1]+".log.txt","a") as file:
            file.write("{0} {1} {2}\n".format(states, [x(game, state) for x in MEAS], test_states_seen))
            
-        dm.save("model_"+sys.argv[1])
         #TODO: implement model saving!
 
 

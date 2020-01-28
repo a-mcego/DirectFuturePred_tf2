@@ -13,6 +13,10 @@ class TrainingType(Enum):
 class MemoryFullStrategy(Enum):
     DELETE_OLD = 1
     DELETE_EVERY_OTHER = 2
+    
+class ColorMode(Enum):
+    COLOR = 1
+    GRAYSCALE = 2
 
 #helper class for actions
 class Actions:
