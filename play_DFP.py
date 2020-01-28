@@ -27,8 +27,10 @@ RANDOM_CHOICE_TYPE = RandomChoiceType.SOFTMAX
 
 TRAINING_TYPE = TrainingType.EXPERIENCE_REPLAY
 #TRAINING_TYPE = TrainingType.FULL_EPISODES
-#the FULL_EPISODES training type uses way too much RAM because
-#TF ends up making a new graph for every episode of different length.
+#TODO: add padding to FULL_EPISODES mode so TF doesn't rebuild the graph every time
+
+#MEMORY_FULL_STRATEGY = MemoryFullStrategy.DELETE_OLD
+MEMORY_FULL_STRATEGY = MemoryFullStrategy.DELETE_EVERY_OTHER
 
 FRAMESKIP = 4
 BATCH_SIZE = 64 #how many steps in one batch of training the network
@@ -191,9 +193,15 @@ class Memories:
         newlen = len(self.mem_episode)
         
         if newlen > MEMORY_SIZE:
-            crop = newlen - MEMORY_SIZE
-            self.mem_episode = self.mem_episode[crop:]
-            self.mem_targets = self.mem_targets[crop:]
+            if MEMORY_FULL_STRATEGY == MemoryFullStrategy.DELETE_OLD:
+                crop = newlen - MEMORY_SIZE
+                self.mem_episode = self.mem_episode[crop:]
+                self.mem_targets = self.mem_targets[crop:]
+            elif MEMORY_FULL_STRATEGY == MemoryFullStrategy.DELETE_EVERY_OTHER:
+                self.mem_episode = self.mem_episode[::2]
+                self.mem_targets = self.mem_targets[::2]
+            else:
+                print("MemoryFullStrategy",repr(MEMORY_FULL_STRATEGY),"not supported.")
         
     def get_random_memories(self, n):
         indices = np.random.randint(self.get_current_len(), size=(n))
