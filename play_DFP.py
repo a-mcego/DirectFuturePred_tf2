@@ -205,6 +205,8 @@ class Memories:
         self.mem_targets = []  
         
 dm = DoomModel(sys.argv[1])
+#TODO: implement model loading!
+
 memories = Memories(memory_size=MEMORY_SIZE)
 
 game = vzd.DoomGame()
@@ -315,7 +317,7 @@ while True:
         
     player_died = game.is_player_dead()
         
-    #add memory to memories
+    #create targets for each timestep and add memory to memories
     meas_memory = np.ndarray(shape=(len(episode_memory),N_GOAL_TIMES,N_MEASUREMENTS))
     for i in range(len(episode_memory)):
         mem = episode_memory[i]
@@ -398,6 +400,7 @@ while True:
         with open("training_"+sys.argv[1]+".log.txt","a") as file:
            file.write("{0} {1} {2}\n".format(states, [x(game, state) for x in MEAS], test_states_seen))
            
+        dm.save("model_"+sys.argv[1])
         #TODO: implement model saving!
 
 
