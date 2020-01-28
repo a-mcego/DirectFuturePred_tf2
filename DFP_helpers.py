@@ -11,7 +11,7 @@ class TrainingType(Enum):
     FULL_EPISODES = 2
 
 class MemoryFullStrategy(Enum):
-    DELETE_OLD = 1
+    DELETE_OLDEST = 1
     DELETE_EVERY_OTHER = 2
     
 class ColorMode(Enum):

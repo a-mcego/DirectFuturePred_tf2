@@ -1,14 +1,14 @@
 import vizdoom as vzd
-import DFP_helpers
+from DFP_helpers import *
 
 #Scenario 1 from the Direct Future Prediction paper
 WAD_NAME = "d1_basic.wad"
 MAP_NAME = "map01"
 VIZDOOM_VARS = [vzd.GameVariable.HEALTH]
-MEAS = [DFP_helpers.get_nth_var(0)]
+MEAS = [get_nth_var(0)]
 MEAS_PREPROCESS_COEFS = [0.01]
 GOAL_MEAS_COEFS = [1.]
-action_list = DFP_helpers.Actions([[vzd.Button.MOVE_FORWARD],[vzd.Button.TURN_LEFT],[vzd.Button.TURN_RIGHT]])
+action_list = Actions([[vzd.Button.MOVE_FORWARD],[vzd.Button.TURN_LEFT],[vzd.Button.TURN_RIGHT]])
 EPISODE_LENGTH = 60*35
 USE_DEPTH_BUFFER = False
 USE_LABELED_RECTS = False

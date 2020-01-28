@@ -17,8 +17,8 @@ from DFP_helpers import *
 #---START---USER-SUPPLIED-SETTINGS---
 
 #these are scenarios, pick one.
-#from d1_basic import *
-from playdoom import *
+from d1_basic import *
+#from playdoom import *
 
 PREDICT_ONLY_DELTAS = True
 
@@ -34,7 +34,7 @@ BATCH_SIZE = 64 #how many steps in one batch of training the network
 MEMORY_SIZE = 20000 #how many steps we keep in the experience memory
 TEST_FREQUENCY = 2500 #how often we test the network, in steps trained
 
-#MEMORY_FULL_STRATEGY = MemoryFullStrategy.DELETE_OLD
+#MEMORY_FULL_STRATEGY = MemoryFullStrategy.DELETE_OLDEST
 MEMORY_FULL_STRATEGY = MemoryFullStrategy.DELETE_EVERY_OTHER
 
 #having goal as an input to the network seems to be unnecessary.
@@ -197,7 +197,7 @@ class Memories:
         newlen = len(self.mem_episode)
         
         if newlen > MEMORY_SIZE:
-            if MEMORY_FULL_STRATEGY == MemoryFullStrategy.DELETE_OLD:
+            if MEMORY_FULL_STRATEGY == MemoryFullStrategy.DELETE_OLDEST:
                 crop = newlen - MEMORY_SIZE
                 self.mem_episode = self.mem_episode[crop:]
                 self.mem_targets = self.mem_targets[crop:]
