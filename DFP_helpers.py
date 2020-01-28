@@ -10,6 +10,10 @@ class TrainingType(Enum):
     EXPERIENCE_REPLAY = 1
     FULL_EPISODES = 2
 
+class MemoryFullStrategy(Enum):
+    DELETE_OLD = 1
+    DELETE_EVERY_OTHER = 2
+
 #helper class for actions
 class Actions:
     def __init__(self, actions):

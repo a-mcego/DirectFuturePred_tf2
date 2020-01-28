@@ -16,12 +16,11 @@ from DFP_helpers import *
 
 #---START---USER-SUPPLIED-SETTINGS---
 
+#these are scenarios, pick one.
 #from d1_basic import *
 from playdoom import *
 
 PREDICT_ONLY_DELTAS = True
-
-IMG_SIZE = 84
 
 #RANDOM_CHOICE_TYPE = RandomChoiceType.UNIFORM
 RANDOM_CHOICE_TYPE = RandomChoiceType.SOFTMAX
@@ -61,10 +60,17 @@ MEAS_POSTPROCESS_COEFS = tf.convert_to_tensor(MEAS_POSTPROCESS_COEFS,dtype=tf.fl
 def init(game,mode):
     game.set_doom_scenario_path(WAD_NAME)
     game.set_doom_map(MAP_NAME)
+    
+    #TODO: add more resolutions
+    if GAME_RESOLUTION == (160,120):
+        game.set_screen_resolution(vzd.ScreenResolution.RES_160X120)
+    elif GAME_RESOLUTION == (320,240):
+        game.set_screen_resolution(vzd.ScreenResolution.RES_320X240)
+    elif GAME_RESOLUTION == (640,480):
+        game.set_screen_resolution(vzd.ScreenResolution.RES_640X480)
+    else:
+        print("Game resolution", GAME_RESOLUTION, "not supported")
 
-    #game.set_screen_resolution(vzd.ScreenResolution.RES_640X480)
-    #game.set_screen_resolution(vzd.ScreenResolution.RES_320X240)
-    game.set_screen_resolution(vzd.ScreenResolution.RES_160X120)
     #game.set_screen_format(vzd.ScreenFormat.RGB24)
     game.set_screen_format(vzd.ScreenFormat.GRAY8)
     game.set_depth_buffer_enabled(USE_DEPTH_BUFFER)
@@ -253,22 +259,22 @@ while True:
     while not game.is_episode_finished():
         state = game.get_state()
         screen_buf = state.screen_buffer
-        screen_buf = cv2.resize(screen_buf, (IMG_SIZE,IMG_SIZE))
+        screen_buf = cv2.resize(screen_buf, (SCALED_RESOLUTION[1],SCALED_RESOLUTION[0]))
         screen_buf = tf.add(tf.multiply(tf.cast(screen_buf,tf.float32),1.0/255.0),-0.5)
         screen_buf = tf.reshape(screen_buf,[1,screen_buf.shape[0],screen_buf.shape[1],1])
         
         if USE_DEPTH_BUFFER:
             depth_buf = state.depth_buffer
-            depth_buf = cv2.resize(depth_buf, (IMG_SIZE,IMG_SIZE))
+            depth_buf = cv2.resize(depth_buf, (SCALED_RESOLUTION[1],SCALED_RESOLUTION[0]))
             depth_buf = tf.add(tf.multiply(tf.cast(depth_buf,tf.float32),1.0/255.0),-0.5)
             depth_buf = tf.reshape(depth_buf,[1,depth_buf.shape[0],depth_buf.shape[1],1])
             screen_buf = tf.concat([screen_buf,depth_buf],axis=-1)
 
         if USE_LABELED_RECTS:
-            canvas_buf = np.zeros([120,160],dtype=np.float32)
+            canvas_buf = np.zeros([GAME_RESOLUTION[1],GAME_RESOLUTION[0]],dtype=np.float32)
             for lab in state.labels:
                 canvas_buf[lab.y:(lab.y+lab.height),lab.x:(lab.x+lab.width)] = 1.0
-            canvas_buf = cv2.resize(canvas_buf, (IMG_SIZE,IMG_SIZE))
+            canvas_buf = cv2.resize(canvas_buf, (SCALED_RESOLUTION[1],SCALED_RESOLUTION[0]))
             canvas_buf = tf.reshape(canvas_buf,[1,canvas_buf.shape[0],canvas_buf.shape[1],1])
             screen_buf = tf.concat([screen_buf,canvas_buf],axis=-1)
 
@@ -349,6 +355,7 @@ while True:
     else:
         print("Training type",repr(TRAINING_TYPE),"not supported")
         
+    #TODO: remove the code duplication caused by separate training and testing code
     if test_state_counter >= TEST_FREQUENCY:
         test_state_counter -= TEST_FREQUENCY
         game.new_episode()
@@ -358,22 +365,22 @@ while True:
             state = game.get_state()
             screen_buf = state.screen_buffer
             #TODO: make it support RGB as well.
-            screen_buf = cv2.resize(screen_buf, (IMG_SIZE,IMG_SIZE))
+            screen_buf = cv2.resize(screen_buf, (SCALED_RESOLUTION[1],SCALED_RESOLUTION[0]))
             screen_buf = tf.add(tf.multiply(tf.cast(screen_buf,tf.float32),1.0/255.0),-0.5)
             screen_buf = tf.reshape(screen_buf,[1,screen_buf.shape[0],screen_buf.shape[1],1])
 
             if USE_DEPTH_BUFFER:
                 depth_buf = state.depth_buffer
-                depth_buf = cv2.resize(depth_buf, (IMG_SIZE,IMG_SIZE))
+                depth_buf = cv2.resize(depth_buf, (SCALED_RESOLUTION[1],SCALED_RESOLUTION[0]))
                 depth_buf = tf.add(tf.multiply(tf.cast(depth_buf,tf.float32),1.0/255.0),-0.5)
                 depth_buf = tf.reshape(depth_buf,[1,depth_buf.shape[0],depth_buf.shape[1],1])
                 screen_buf = tf.concat([screen_buf,depth_buf],axis=-1)
 
             if USE_LABELED_RECTS:
-                canvas_buf = np.zeros([120,160],dtype=np.float32)#TODO: make 160,120 depend on original screen_buf shape
+                canvas_buf = np.zeros([GAME_RESOLUTION[1],GAME_RESOLUTION[0]],dtype=np.float32)
                 for lab in state.labels:
                     canvas_buf[lab.y:(lab.y+lab.height),lab.x:(lab.x+lab.width)] = 1.0
-                canvas_buf = cv2.resize(canvas_buf, (IMG_SIZE,IMG_SIZE))
+                canvas_buf = cv2.resize(canvas_buf, (SCALED_RESOLUTION[1],SCALED_RESOLUTION[0]))
                 canvas_buf = tf.reshape(canvas_buf,[1,canvas_buf.shape[0],canvas_buf.shape[1],1])
                 screen_buf = tf.concat([screen_buf,canvas_buf],axis=-1)
 
