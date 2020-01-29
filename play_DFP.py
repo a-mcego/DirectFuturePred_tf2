@@ -20,14 +20,15 @@ from DFP_helpers import *
 from d1_basic import *
 #from playdoom import *
 
+#with this, the network only predicts how much the measurements have changed
+#and not the measurements themselves
 PREDICT_ONLY_DELTAS = True
 
 #RANDOM_CHOICE_TYPE = RandomChoiceType.UNIFORM
 RANDOM_CHOICE_TYPE = RandomChoiceType.SOFTMAX
 
-#TRAINING_TYPE = TrainingType.EXPERIENCE_REPLAY
-TRAINING_TYPE = TrainingType.FULL_EPISODES
-#TODO: add padding to FULL_EPISODES mode so TF doesn't rebuild the graph every time
+TRAINING_TYPE = TrainingType.EXPERIENCE_REPLAY
+#TRAINING_TYPE = TrainingType.FULL_EPISODES
 
 FRAMESKIP = 4
 BATCH_SIZE = 64 #how many steps in one batch of training the network
@@ -40,6 +41,9 @@ MEMORY_FULL_STRATEGY = MemoryFullStrategy.DELETE_EVERY_OTHER
 #having goal as an input to the network seems to be unnecessary.
 #here's a way to turn it off! :)
 USE_GOAL_INPUT = False
+
+#shall we input the last action made to the new timestep?
+USE_LAST_ACTION_INPUT = True
 
 #---END---USER-SUPPLIED-SETTINGS---
 
@@ -111,8 +115,6 @@ def init(game,mode):
     game.set_mode(mode)
     game.init()
     
-
-
 class DoomModel(tf.keras.Model):
     def __init__(self, filename):
         self.lrelu = lambda x: tf.keras.activations.relu(x, alpha=0.2)
@@ -133,7 +135,10 @@ class DoomModel(tf.keras.Model):
             self.g1 = tf.keras.layers.Dense(128, activation=self.lrelu)
             self.g2 = tf.keras.layers.Dense(128, activation=self.lrelu)
             self.g3 = tf.keras.layers.Dense(128, activation=self.lrelu)
-        
+            
+        if USE_LAST_ACTION_INPUT:
+            self.last_action = tf.keras.layers.Embedding(action_list.total, 128)
+            
         self.action1 = tf.keras.layers.Dense(512, activation=self.lrelu)
         self.action2 = tf.keras.layers.Dense(N_MEASUREMENTS*N_GOAL_TIMES*N_ACTIONS)
 
@@ -141,7 +146,7 @@ class DoomModel(tf.keras.Model):
         self.expect2 = tf.keras.layers.Dense(N_MEASUREMENTS*N_GOAL_TIMES)
 
     @tf.function
-    def call(self, image, measurements, goal):
+    def call(self, image, measurements, goal, last_actions):
         image_out = image
         image_out = self.c1(image_out)
         image_out = self.c2(image_out)
@@ -158,9 +163,15 @@ class DoomModel(tf.keras.Model):
             goal_out = self.g1(goal_out)
             goal_out = self.g2(goal_out)
             goal_out = self.g3(goal_out)
-            concated = tf.concat([image_out,meas_out,goal_out],axis=-1)
+            concated = [image_out,meas_out,goal_out]
         else:
-            concated = tf.concat([image_out,meas_out],axis=-1)
+            concated = [image_out,meas_out]
+            
+        if USE_LAST_ACTION_INPUT:
+            embedded = self.last_action(last_actions)
+            concated.append(embedded)
+        
+        concated = tf.concat(concated,axis=-1)
         
         acts = self.action1(concated)
         acts = self.action2(acts)
@@ -234,9 +245,9 @@ init(game,vzd.Mode.PLAYER)
 optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4, beta_1=0.95, beta_2=0.999, epsilon=1e-4)
 
 @tf.function
-def train_func(screen_buf,gamevars,goal,actions,targets,padding_mask):
+def train_func(screen_buf,gamevars,goal,actions,last_actions,targets,padding_mask):
     with tf.GradientTape() as tape:
-        out = dm(screen_buf,gamevars,goal)
+        out = dm(screen_buf,gamevars,goal,last_actions)
         consec = tf.range(actions.shape[0])
         total = tf.stack([consec,actions],axis=-1)
         out2 = tf.gather_nd(out,total)
@@ -250,7 +261,6 @@ def train_func(screen_buf,gamevars,goal,actions,targets,padding_mask):
     gradients = tape.gradient(loss, dm.trainable_variables)
     optimizer.apply_gradients(zip(gradients, dm.trainable_variables))
 
-#
 def get_padded_length(n):
     lengths = [150,200,300,400,600,800,1200,1600]
     for l in lengths:
@@ -271,6 +281,7 @@ def train(eps, targets):
     gamevars = tf.concat([e[1] for e in eps],axis=0)
     goal = tf.concat([e[2] for e in eps],axis=0)
     actions = tf.convert_to_tensor([e[3] for e in eps],dtype=tf.int32)
+    last_actions = tf.convert_to_tensor([e[4] for e in eps],dtype=tf.int32)
     targets = tf.cast(tf.transpose(tf.stack(targets,axis=0),perm=[0,2,1]),dtype=tf.float32)
     padding_mask = None
     
@@ -283,61 +294,55 @@ def train(eps, targets):
         gamevars = pad_tensor_to_len(gamevars, padded_len)
         goal = pad_tensor_to_len(goal, padded_len)
         actions = pad_tensor_to_len(actions, padded_len)
+        last_actions = pad_tensor_to_len(last_actions, padded_len)
         targets = pad_tensor_to_len(targets, padded_len)
         padding_mask = pad_tensor_to_len(tf.ones(original_len,dtype=tf.float32),padded_len)
     
-    train_func(screen_buf,gamevars,goal,actions,targets,padding_mask)
+    train_func(screen_buf,gamevars,goal,actions,last_actions,targets,padding_mask)
     
 
 epsilon_func = lambda step: (0.02 + 145000. / (float(step) + 150000.))
 
-states=0
-test_state_counter=0
-added_states=0
-startstate = states
-starttime = time.time()
-while True:
-    game.new_episode()
-    episode_memory = []
-    goal = tf.expand_dims(tf.einsum("a,b->ab",GOAL_MEAS_COEFS,GOAL_TEMPORAL_COEFS),axis=0)
-    while not game.is_episode_finished():
-        state = game.get_state()
+#one step of the network
+#returns the action chosen
+def one_step(game, last_action, episode_memory=None, epsilon=None):
+    state = game.get_state()
 
-        screen_buf = state.screen_buffer
-        screen_buf = cv2.resize(screen_buf, (SCALED_RESOLUTION[1],SCALED_RESOLUTION[0]))
-        screen_buf = tf.add(tf.multiply(tf.cast(screen_buf,tf.float32),1.0/255.0),-0.5)
-        if COLORMODE == ColorMode.GRAYSCALE:
-            screen_buf = tf.reshape(screen_buf,[1,screen_buf.shape[0],screen_buf.shape[1],1])
-        elif COLORMODE == ColorMode.COLOR:
-            screen_buf = tf.reshape(screen_buf,[1,screen_buf.shape[0],screen_buf.shape[1],3])
-        
-        if USE_DEPTH_BUFFER:
-            depth_buf = state.depth_buffer
-            depth_buf = cv2.resize(depth_buf, (SCALED_RESOLUTION[1],SCALED_RESOLUTION[0]))
-            depth_buf = tf.add(tf.multiply(tf.cast(depth_buf,tf.float32),1.0/255.0),-0.5)
-            depth_buf = tf.reshape(depth_buf,[1,depth_buf.shape[0],depth_buf.shape[1],1])
-            screen_buf = tf.concat([screen_buf,depth_buf],axis=-1)
+    screen_buf = state.screen_buffer
+    screen_buf = cv2.resize(screen_buf, (SCALED_RESOLUTION[1],SCALED_RESOLUTION[0]))
+    screen_buf = tf.add(tf.multiply(tf.cast(screen_buf,tf.float32),1.0/255.0),-0.5)
+    if COLORMODE == ColorMode.GRAYSCALE:
+        screen_buf = tf.reshape(screen_buf,[1,screen_buf.shape[0],screen_buf.shape[1],1])
+    elif COLORMODE == ColorMode.COLOR:
+        screen_buf = tf.reshape(screen_buf,[1,screen_buf.shape[0],screen_buf.shape[1],3])
+    
+    if USE_DEPTH_BUFFER:
+        depth_buf = state.depth_buffer
+        depth_buf = cv2.resize(depth_buf, (SCALED_RESOLUTION[1],SCALED_RESOLUTION[0]))
+        depth_buf = tf.add(tf.multiply(tf.cast(depth_buf,tf.float32),1.0/255.0),-0.5)
+        depth_buf = tf.reshape(depth_buf,[1,depth_buf.shape[0],depth_buf.shape[1],1])
+        screen_buf = tf.concat([screen_buf,depth_buf],axis=-1)
 
-        if USE_LABELED_RECTS:
-            canvas_buf = np.zeros([GAME_RESOLUTION[1],GAME_RESOLUTION[0]],dtype=np.float32)
-            for lab in state.labels:
-                canvas_buf[lab.y:(lab.y+lab.height),lab.x:(lab.x+lab.width)] = 1.0
-            canvas_buf = cv2.resize(canvas_buf, (SCALED_RESOLUTION[1],SCALED_RESOLUTION[0]))
-            canvas_buf = tf.reshape(canvas_buf,[1,canvas_buf.shape[0],canvas_buf.shape[1],1])
-            screen_buf = tf.concat([screen_buf,canvas_buf],axis=-1)
+    if USE_LABELED_RECTS:
+        canvas_buf = np.zeros([GAME_RESOLUTION[1],GAME_RESOLUTION[0]],dtype=np.float32)
+        for lab in state.labels:
+            canvas_buf[lab.y:(lab.y+lab.height),lab.x:(lab.x+lab.width)] = 1.0
+        canvas_buf = cv2.resize(canvas_buf, (SCALED_RESOLUTION[1],SCALED_RESOLUTION[0]))
+        canvas_buf = tf.reshape(canvas_buf,[1,canvas_buf.shape[0],canvas_buf.shape[1],1])
+        screen_buf = tf.concat([screen_buf,canvas_buf],axis=-1)
 
-        gamevars = tf.expand_dims(tf.convert_to_tensor([x(game,state) for x in MEAS], dtype=np.float32),axis=0)
-        gamevars = tf.multiply(gamevars, MEAS_PREPROCESS_COEFS) #PREPROCESS
-        actions = dm(screen_buf,gamevars,goal)
-        actions = tf.squeeze(actions,axis=0) #[N_ACTIONS,N_MEASUREMENTS,N_GOAL_TIMES]
-        
-        epsilon = epsilon_func(states)
+    gamevars = tf.expand_dims(tf.convert_to_tensor([x(game,state) for x in MEAS], dtype=np.float32),axis=0)
+    gamevars = tf.multiply(gamevars, MEAS_PREPROCESS_COEFS) #PREPROCESS
+    actions = dm(screen_buf,gamevars,goal,tf.reshape(last_action,[1]))
+    actions = tf.squeeze(actions,axis=0) #[N_ACTIONS,N_MEASUREMENTS,N_GOAL_TIMES]
+    
+    if epsilon is None:
+        chosen_action = tf.multiply(actions,tf.reshape(GOAL_TEMPORAL_COEFS,[1,1,N_GOAL_TIMES]))
+        chosen_action = tf.einsum("abc,b->ac", chosen_action, GOAL_MEAS_COEFS)
+        chosen_action = tf.reduce_sum(chosen_action,axis=-1)
+        chosen_action = tf.cast(tf.argmax(chosen_action,axis=0),tf.int32)
+    else:
         rand = np.random.rand(1)
-        
-        #debug print
-        #print([x(game,state) for x in MEAS], game.is_player_dead())
-        
-        #crude epsilon thingy system
         if rand[0] >= epsilon:
             chosen_action = tf.multiply(actions,tf.reshape(GOAL_TEMPORAL_COEFS,[1,1,N_GOAL_TIMES]))
             chosen_action = tf.einsum("abc,b->ac", chosen_action, GOAL_MEAS_COEFS)
@@ -354,21 +359,41 @@ while True:
                 chosen_action = choose(softmaxed)
             else:
                 print("Random choice type",repr(RANDOM_CHOICE_TYPE),"not supported.")
-            
-        episode_memory.append([screen_buf,gamevars,goal,chosen_action])
 
-        action_vector = action_list.number_to_vector(chosen_action)
+    if episode_memory is not None:
+        episode_memory.append([screen_buf,gamevars,goal,chosen_action,last_action])
+
+    action_vector = action_list.number_to_vector(chosen_action)
+    
+    game.set_action(action_vector)
+    return chosen_action
+    
+states=0
+test_state_counter=0
+added_states=0
+startstate = states
+starttime = time.time()
+while True:
+    game.new_episode()
+    episode_memory = []
+    goal = tf.expand_dims(tf.einsum("a,b->ab",GOAL_MEAS_COEFS,GOAL_TEMPORAL_COEFS),axis=0)
+    last_action = tf.zeros([],dtype=tf.int32)
+    episode_length = 0
+    while not game.is_episode_finished():
+        epsilon = epsilon_func(states+episode_length)
+        last_action = one_step(game,last_action,episode_memory,epsilon)
+        episode_length += 1
         
-        states += 1
-        added_states += 1
-        test_state_counter += 1
-
         if game.is_player_dead():
             break
         
-        game.set_action(action_vector)
         game.advance_action(FRAMESKIP)
         
+    assert(episode_length == len(episode_memory))
+    states += episode_length
+    added_states += episode_length
+    test_state_counter += episode_length
+
     player_died = game.is_player_dead()
         
     #create targets for each timestep and add memory to memories
@@ -408,55 +433,22 @@ while True:
         test_state_counter -= TEST_FREQUENCY
         game.new_episode()
         goal = tf.expand_dims(tf.einsum("a,b->ab",GOAL_MEAS_COEFS,GOAL_TEMPORAL_COEFS),axis=0)
-        test_states_seen = 0
+        last_action = tf.zeros([],dtype=tf.int32)
+        episode_length = 0
         while not game.is_episode_finished():
-            state = game.get_state()
-            
-            screen_buf = state.screen_buffer
-            screen_buf = cv2.resize(screen_buf, (SCALED_RESOLUTION[1],SCALED_RESOLUTION[0]))
-            screen_buf = tf.add(tf.multiply(tf.cast(screen_buf,tf.float32),1.0/255.0),-0.5)
-            if COLORMODE == ColorMode.GRAYSCALE:
-                screen_buf = tf.reshape(screen_buf,[1,screen_buf.shape[0],screen_buf.shape[1],1])
-            elif COLORMODE == ColorMode.COLOR:
-                screen_buf = tf.reshape(screen_buf,[1,screen_buf.shape[0],screen_buf.shape[1],3])
-            
-            if USE_DEPTH_BUFFER:
-                depth_buf = state.depth_buffer
-                depth_buf = cv2.resize(depth_buf, (SCALED_RESOLUTION[1],SCALED_RESOLUTION[0]))
-                depth_buf = tf.add(tf.multiply(tf.cast(depth_buf,tf.float32),1.0/255.0),-0.5)
-                depth_buf = tf.reshape(depth_buf,[1,depth_buf.shape[0],depth_buf.shape[1],1])
-                screen_buf = tf.concat([screen_buf,depth_buf],axis=-1)
-
-            if USE_LABELED_RECTS:
-                canvas_buf = np.zeros([GAME_RESOLUTION[1],GAME_RESOLUTION[0]],dtype=np.float32)
-                for lab in state.labels:
-                    canvas_buf[lab.y:(lab.y+lab.height),lab.x:(lab.x+lab.width)] = 1.0
-                canvas_buf = cv2.resize(canvas_buf, (SCALED_RESOLUTION[1],SCALED_RESOLUTION[0]))
-                canvas_buf = tf.reshape(canvas_buf,[1,canvas_buf.shape[0],canvas_buf.shape[1],1])
-                screen_buf = tf.concat([screen_buf,canvas_buf],axis=-1)
-
-            gamevars = tf.expand_dims(tf.convert_to_tensor([x(game,state) for x in MEAS], dtype=np.float32),axis=0)
-            gamevars = tf.multiply(gamevars, MEAS_PREPROCESS_COEFS) #PREPROCESS
-            actions = dm(screen_buf,gamevars,goal)
-            actions = tf.reshape(actions,[N_ACTIONS,N_MEASUREMENTS,N_GOAL_TIMES])
-            chosen_action = tf.multiply(actions,tf.reshape(GOAL_TEMPORAL_COEFS,[1,1,N_GOAL_TIMES]))
-            chosen_action = tf.einsum("abc,b->ac", chosen_action, GOAL_MEAS_COEFS)
-            chosen_action = tf.reduce_sum(chosen_action,axis=-1)
-            chosen_action = tf.argmax(chosen_action,axis=0)
-            action_vector = action_list.number_to_vector(chosen_action)
-
-            test_states_seen += 1
-
+            last_action = one_step(game, last_action)
+        
+            episode_length += 1
             if game.is_player_dead():
                 break
-            
-            game.set_action(action_vector)
+
             game.advance_action(FRAMESKIP)
-        print(states, "steps seen,", [x(game, state) for x in MEAS],", survived for", test_states_seen, "steps,", (states-startstate)*1./(time.time()-starttime)," steps/s")
+            
+        print(states, "steps seen,", [x(game, game.get_state()) for x in MEAS],", survived for", episode_length, "steps,", (states-startstate)*1./(time.time()-starttime)," steps/s")
         startstate = states
         starttime = time.time()
         with open("training_"+sys.argv[1]+".log.txt","a") as file:
-           file.write("{0} {1} {2}\n".format(states, [x(game, state) for x in MEAS], test_states_seen))
+           file.write("{0} {1} {2}\n".format(states, [x(game, game.get_state()) for x in MEAS], episode_length))
            
         #TODO: implement model saving!
 
