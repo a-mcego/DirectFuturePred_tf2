@@ -9,7 +9,7 @@ import sys
 import cv2
 
 if len(sys.argv) != 2:
-    print("Give model savefile as argument.")
+    print("Give logfile name as argument.")
     exit(0)
 
 from DFP_helpers import *
@@ -366,7 +366,7 @@ def one_step(game, last_action, episode_memory=None, epsilon=None):
     action_vector = action_list.number_to_vector(chosen_action)
     
     game.set_action(action_vector)
-    return chosen_action
+    return state,chosen_action
     
 states=0
 test_state_counter=0
@@ -381,7 +381,7 @@ while True:
     episode_length = 0
     while not game.is_episode_finished():
         epsilon = epsilon_func(states+episode_length)
-        last_action = one_step(game,last_action,episode_memory,epsilon)
+        game_state, last_action = one_step(game,last_action,episode_memory,epsilon)
         episode_length += 1
         
         if game.is_player_dead():
@@ -436,7 +436,7 @@ while True:
         last_action = tf.zeros([],dtype=tf.int32)
         episode_length = 0
         while not game.is_episode_finished():
-            last_action = one_step(game, last_action)
+            game_state, last_action = one_step(game, last_action)
         
             episode_length += 1
             if game.is_player_dead():
@@ -444,11 +444,11 @@ while True:
 
             game.advance_action(FRAMESKIP)
             
-        print(states, "steps seen,", [x(game, game.get_state()) for x in MEAS],", survived for", episode_length, "steps,", (states-startstate)*1./(time.time()-starttime)," steps/s")
+        print(states, "steps seen,", [x(game, game_state) for x in MEAS],", survived for", episode_length, "steps,", (states-startstate)*1./(time.time()-starttime)," steps/s")
         startstate = states
         starttime = time.time()
         with open("training_"+sys.argv[1]+".log.txt","a") as file:
-           file.write("{0} {1} {2}\n".format(states, [x(game, game.get_state()) for x in MEAS], episode_length))
+           file.write("{0} {1} {2}\n".format(states, [x(game, game_state) for x in MEAS], episode_length))
            
         #TODO: implement model saving!
 
