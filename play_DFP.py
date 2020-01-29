@@ -25,8 +25,8 @@ PREDICT_ONLY_DELTAS = True
 #RANDOM_CHOICE_TYPE = RandomChoiceType.UNIFORM
 RANDOM_CHOICE_TYPE = RandomChoiceType.SOFTMAX
 
-TRAINING_TYPE = TrainingType.EXPERIENCE_REPLAY
-#TRAINING_TYPE = TrainingType.FULL_EPISODES
+#TRAINING_TYPE = TrainingType.EXPERIENCE_REPLAY
+TRAINING_TYPE = TrainingType.FULL_EPISODES
 #TODO: add padding to FULL_EPISODES mode so TF doesn't rebuild the graph every time
 
 FRAMESKIP = 4
@@ -234,7 +234,7 @@ init(game,vzd.Mode.PLAYER)
 optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4, beta_1=0.95, beta_2=0.999, epsilon=1e-4)
 
 @tf.function
-def train_func(screen_buf,gamevars,goal,actions,targets):
+def train_func(screen_buf,gamevars,goal,actions,targets,padding_mask):
     with tf.GradientTape() as tape:
         out = dm(screen_buf,gamevars,goal)
         consec = tf.range(actions.shape[0])
@@ -244,9 +244,27 @@ def train_func(screen_buf,gamevars,goal,actions,targets):
         #hack: target less than -1 million means the target doesn't exist
         #      i tried using NaN for this but failed for whatever reason
         loss = tf.where(targets < -1000000.0,tf.zeros_like(out2),tf.square(targets-out2))
+        if padding_mask is not None:
+            loss = tf.multiply(loss,tf.reshape(padding_mask,[padding_mask.shape[0],1,1]))
 
     gradients = tape.gradient(loss, dm.trainable_variables)
     optimizer.apply_gradients(zip(gradients, dm.trainable_variables))
+
+#
+def get_padded_length(n):
+    lengths = [150,200,300,400,600,800,1200,1600]
+    for l in lengths:
+        if l >= n:
+            return l
+    return n
+
+def pad_tensor_to_len(tensor, new_len):
+    added_amount = new_len-tensor.shape[0]
+    if added_amount < 0:
+        print("pad_tensor_to_len: Added amount less than 0")
+
+    pad = tf.zeros(shape=([added_amount]+tensor.shape[1:]),dtype=tensor.dtype)
+    return tf.concat([tensor,pad],axis=0)
 
 def train(eps, targets):
     screen_buf = tf.concat([e[0] for e in eps],axis=0)
@@ -254,7 +272,21 @@ def train(eps, targets):
     goal = tf.concat([e[2] for e in eps],axis=0)
     actions = tf.convert_to_tensor([e[3] for e in eps],dtype=tf.int32)
     targets = tf.cast(tf.transpose(tf.stack(targets,axis=0),perm=[0,2,1]),dtype=tf.float32)
-    train_func(screen_buf,gamevars,goal,actions,targets)
+    padding_mask = None
+    
+    if TRAINING_TYPE == TrainingType.FULL_EPISODES:
+        original_len = actions.shape[0]
+        padded_len = get_padded_length(original_len)
+        
+        #this is ugly repetitive code, wonder if there's a better way
+        screen_buf = pad_tensor_to_len(screen_buf, padded_len)
+        gamevars = pad_tensor_to_len(gamevars, padded_len)
+        goal = pad_tensor_to_len(goal, padded_len)
+        actions = pad_tensor_to_len(actions, padded_len)
+        targets = pad_tensor_to_len(targets, padded_len)
+        padding_mask = pad_tensor_to_len(tf.ones(original_len,dtype=tf.float32),padded_len)
+    
+    train_func(screen_buf,gamevars,goal,actions,targets,padding_mask)
     
 
 epsilon_func = lambda step: (0.02 + 145000. / (float(step) + 150000.))
