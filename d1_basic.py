@@ -6,6 +6,7 @@ WAD_NAME = "d1_basic.wad"
 MAP_NAME = "map01"
 VIZDOOM_VARS = [vzd.GameVariable.HEALTH]
 MEAS = [get_nth_var(0)]
+MEAS_TYPES = [MeasType.ABSOLUTE]
 MEAS_PREPROCESS_COEFS = [0.01]
 GOAL_MEAS_COEFS = [1.]
 action_list = Actions([[vzd.Button.MOVE_FORWARD],[vzd.Button.TURN_LEFT],[vzd.Button.TURN_RIGHT]])

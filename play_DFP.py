@@ -17,8 +17,8 @@ from DFP_helpers import *
 #---START---USER-SUPPLIED-SETTINGS---
 
 #these are scenarios, pick one.
-from d1_basic import *
-#from playdoom import *
+#from d1_basic import *
+from playdoom import *
 
 #with this, the network only predicts how much the measurements have changed
 #and not the measurements themselves
@@ -61,6 +61,7 @@ GOAL_TEMPORAL_COEFS = tf.convert_to_tensor(GOAL_TEMPORAL_COEFS,dtype=tf.float32)
 GOAL_MEAS_COEFS = tf.convert_to_tensor(GOAL_MEAS_COEFS,dtype=tf.float32)
 MEAS_PREPROCESS_COEFS = tf.convert_to_tensor(MEAS_PREPROCESS_COEFS,dtype=tf.float32)
 MEAS_POSTPROCESS_COEFS = tf.convert_to_tensor(MEAS_POSTPROCESS_COEFS,dtype=tf.float32)
+MEAS_MASK = tf.expand_dims(tf.convert_to_tensor([t != MeasType.DELTA for t in MEAS_TYPES],dtype=tf.float32),axis=0)
 
 
 def init(game,mode):
@@ -153,7 +154,8 @@ class DoomModel(tf.keras.Model):
         image_out = self.c3(image_out)
         image_out = self.c4(tf.reshape(image_out,[image_out.shape[0],-1]))
         
-        meas_out = measurements
+        #here we mask out the measurements we don't want to give to the network...
+        meas_out = tf.multiply(measurements,MEAS_MASK)
         meas_out = self.m1(meas_out)
         meas_out = self.m2(meas_out)
         meas_out = self.m3(meas_out)
@@ -186,6 +188,8 @@ class DoomModel(tf.keras.Model):
         total = tf.add(acts,expects)
 
         if PREDICT_ONLY_DELTAS:
+            #...but note that here we use the *non-masked* measurements
+            #   to make it possible to predict deltas!
             total = tf.add(total,tf.expand_dims(tf.expand_dims(measurements,axis=1),axis=-1))
 
         return total
@@ -395,7 +399,7 @@ while True:
     test_state_counter += episode_length
 
     player_died = game.is_player_dead()
-        
+    
     #create targets for each timestep and add memory to memories
     meas_memory = np.ndarray(shape=(len(episode_memory),N_GOAL_TIMES,N_MEASUREMENTS))
     for i in range(len(episode_memory)):
@@ -428,7 +432,6 @@ while True:
     else:
         print("Training type",repr(TRAINING_TYPE),"not supported")
         
-    #TODO: remove the code duplication caused by separate training and testing code
     if test_state_counter >= TEST_FREQUENCY:
         test_state_counter -= TEST_FREQUENCY
         game.new_episode()
@@ -465,6 +468,5 @@ or maybe seen linedefs?
 or all of the above! :D
 
 IDEAS:
-do X, something should happen, but it doesnt happen. this should ring alarm bells with the bot.
-add previous action to the network input
+some sort of "surprise" system. possibly the same as "curiosity" as described by that one paper
 """

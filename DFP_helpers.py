@@ -17,6 +17,10 @@ class MemoryFullStrategy(Enum):
 class ColorMode(Enum):
     COLOR = 1
     GRAYSCALE = 2
+    
+class MeasType(Enum):
+    ABSOLUTE = 1
+    DELTA = 2
 
 #helper class for actions
 class Actions:
