@@ -17,8 +17,8 @@ from DFP_helpers import *
 #---START---USER-SUPPLIED-SETTINGS---
 
 #these are scenarios, pick one.
-#from d1_basic import *
-from playdoom import *
+from d1_basic import *
+#from playdoom import *
 
 #with this, the network only predicts how much the measurements have changed
 #and not the measurements themselves
@@ -27,8 +27,9 @@ PREDICT_ONLY_DELTAS = True
 #RANDOM_CHOICE_TYPE = RandomChoiceType.UNIFORM
 RANDOM_CHOICE_TYPE = RandomChoiceType.SOFTMAX
 
-TRAINING_TYPE = TrainingType.EXPERIENCE_REPLAY
-#TRAINING_TYPE = TrainingType.FULL_EPISODES
+#TRAINING_TYPE = TrainingType.EXPERIENCE_REPLAY
+TRAINING_TYPE = TrainingType.FULL_EPISODES
+#TRAINING_TYPE = TrainingType.FULL_EPISODES_RECURRENT
 
 FRAMESKIP = 4
 BATCH_SIZE = 64 #how many steps in one batch of training the network
@@ -139,15 +140,19 @@ class DoomModel(tf.keras.Model):
             
         if USE_LAST_ACTION_INPUT:
             self.last_action = tf.keras.layers.Embedding(action_list.total, 128)
-            
+        
+        if TRAINING_TYPE == TrainingType.FULL_EPISODES_RECURRENT:
+            self.lstm1 = tf.keras.layers.LSTM(512,return_sequences=True,return_state=True)
+
         self.action1 = tf.keras.layers.Dense(512, activation=self.lrelu)
         self.action2 = tf.keras.layers.Dense(N_MEASUREMENTS*N_GOAL_TIMES*N_ACTIONS)
 
         self.expect1 = tf.keras.layers.Dense(512, activation=self.lrelu)
         self.expect2 = tf.keras.layers.Dense(N_MEASUREMENTS*N_GOAL_TIMES)
+        
 
     @tf.function
-    def call(self, image, measurements, goal, last_actions):
+    def call(self, image, measurements, goal, last_actions, bool_mask=None, in_state=None):
         image_out = image
         image_out = self.c1(image_out)
         image_out = self.c2(image_out)
@@ -175,6 +180,13 @@ class DoomModel(tf.keras.Model):
         
         concated = tf.concat(concated,axis=-1)
         
+        if TRAINING_TYPE == TrainingType.FULL_EPISODES_RECURRENT:
+            concated = self.lstm1(tf.expand_dims(concated,axis=0), initial_state=in_state)
+            ret_state = concated[1:]
+            concated = tf.squeeze(concated[0],axis=0)
+        else:
+            ret_state = None
+
         acts = self.action1(concated)
         acts = self.action2(acts)
         acts = tf.add(acts,-tf.reduce_mean(acts,axis=-1,keepdims=True))
@@ -192,7 +204,7 @@ class DoomModel(tf.keras.Model):
             #   to make it possible to predict deltas!
             total = tf.add(total,tf.expand_dims(tf.expand_dims(measurements,axis=1),axis=-1))
 
-        return total
+        return total,ret_state
 
 class Memories:
     def __init__(self, memory_size):
@@ -251,7 +263,7 @@ optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4, beta_1=0.95, beta_2=0.9
 @tf.function
 def train_func(screen_buf,gamevars,goal,actions,last_actions,targets,padding_mask):
     with tf.GradientTape() as tape:
-        out = dm(screen_buf,gamevars,goal,last_actions)
+        out,_ = dm(screen_buf,gamevars,goal,last_actions,tf.cast(padding_mask,tf.bool))
         consec = tf.range(actions.shape[0])
         total = tf.stack([consec,actions],axis=-1)
         out2 = tf.gather_nd(out,total)
@@ -289,7 +301,7 @@ def train(eps, targets):
     targets = tf.cast(tf.transpose(tf.stack(targets,axis=0),perm=[0,2,1]),dtype=tf.float32)
     padding_mask = None
     
-    if TRAINING_TYPE == TrainingType.FULL_EPISODES:
+    if TRAINING_TYPE == TrainingType.FULL_EPISODES or TRAINING_TYPE == TrainingType.FULL_EPISODES_RECURRENT:
         original_len = actions.shape[0]
         padded_len = get_padded_length(original_len)
         
@@ -309,7 +321,7 @@ epsilon_func = lambda step: (0.02 + 145000. / (float(step) + 150000.))
 
 #one step of the network
 #returns the action chosen
-def one_step(game, last_action, episode_memory=None, epsilon=None):
+def one_step(game, last_action, episode_memory=None, epsilon=None, in_recurrent=None):
     state = game.get_state()
 
     screen_buf = state.screen_buffer
@@ -337,7 +349,9 @@ def one_step(game, last_action, episode_memory=None, epsilon=None):
 
     gamevars = tf.expand_dims(tf.convert_to_tensor([x(game,state) for x in MEAS], dtype=np.float32),axis=0)
     gamevars = tf.multiply(gamevars, MEAS_PREPROCESS_COEFS) #PREPROCESS
-    actions = dm(screen_buf,gamevars,goal,tf.reshape(last_action,[1]))
+    dm_ret = dm(screen_buf,gamevars,goal,tf.reshape(last_action,[1]),in_state=in_recurrent)
+    actions = dm_ret[0]
+    recurrent_state = dm_ret[1]
     actions = tf.squeeze(actions,axis=0) #[N_ACTIONS,N_MEASUREMENTS,N_GOAL_TIMES]
     
     if epsilon is None:
@@ -370,7 +384,7 @@ def one_step(game, last_action, episode_memory=None, epsilon=None):
     action_vector = action_list.number_to_vector(chosen_action)
     
     game.set_action(action_vector)
-    return state,chosen_action
+    return state,chosen_action,recurrent_state
     
 states=0
 test_state_counter=0
@@ -383,9 +397,12 @@ while True:
     goal = tf.expand_dims(tf.einsum("a,b->ab",GOAL_MEAS_COEFS,GOAL_TEMPORAL_COEFS),axis=0)
     last_action = tf.zeros([],dtype=tf.int32)
     episode_length = 0
+    
+    recurrent_state = None
+    
     while not game.is_episode_finished():
         epsilon = epsilon_func(states+episode_length)
-        game_state, last_action = one_step(game,last_action,episode_memory,epsilon)
+        game_state, last_action,recurrent_state = one_step(game,last_action,episode_memory,epsilon,recurrent_state)
         episode_length += 1
         
         if game.is_player_dead():
@@ -425,7 +442,7 @@ while True:
             ep, tgt = memories.get_random_memories(BATCH_SIZE)
             train(ep, tgt)
             added_states -= BATCH_SIZE
-    elif TRAINING_TYPE == TrainingType.FULL_EPISODES:
+    elif TRAINING_TYPE == TrainingType.FULL_EPISODES or TRAINING_TYPE == TrainingType.FULL_EPISODES_RECURRENT:
         ep, tgt = memories.get_all_memories()
         train(ep, tgt)
         memories.clear()
@@ -439,7 +456,7 @@ while True:
         last_action = tf.zeros([],dtype=tf.int32)
         episode_length = 0
         while not game.is_episode_finished():
-            game_state, last_action = one_step(game, last_action)
+            game_state, last_action, _ = one_step(game, last_action)
         
             episode_length += 1
             if game.is_player_dead():

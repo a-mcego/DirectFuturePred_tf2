@@ -9,6 +9,7 @@ class RandomChoiceType(Enum):
 class TrainingType(Enum):
     EXPERIENCE_REPLAY = 1
     FULL_EPISODES = 2
+    FULL_EPISODES_RECURRENT = 3
 
 class MemoryFullStrategy(Enum):
     DELETE_OLDEST = 1
