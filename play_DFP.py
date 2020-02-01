@@ -7,6 +7,8 @@ import time
 import numpy as np
 import sys
 import cv2
+import threading
+import concurrent.futures
 
 if len(sys.argv) != 2:
     print("Give logfile name as argument.")
@@ -46,6 +48,9 @@ USE_GOAL_INPUT = False
 #shall we input the last action made to the new timestep?
 USE_LAST_ACTION_INPUT = True
 
+#how many ViZDoom instances we learn with?
+N_VIZDOOM_INSTANCES = 4
+
 #---END---USER-SUPPLIED-SETTINGS---
 
 N_GOAL_TIMES = len(GOAL_TIMES)
@@ -64,57 +69,71 @@ MEAS_PREPROCESS_COEFS = tf.convert_to_tensor(MEAS_PREPROCESS_COEFS,dtype=tf.floa
 MEAS_POSTPROCESS_COEFS = tf.convert_to_tensor(MEAS_POSTPROCESS_COEFS,dtype=tf.float32)
 MEAS_MASK = tf.expand_dims(tf.convert_to_tensor([t != MeasType.DELTA for t in MEAS_TYPES],dtype=tf.float32),axis=0)
 
-def init(game,mode):
-    game.set_doom_scenario_path(WAD_NAME)
-    game.set_doom_map(MAP_NAME)
-    
-    #TODO: add more resolutions
-    if GAME_RESOLUTION == (160,120):
-        game.set_screen_resolution(vzd.ScreenResolution.RES_160X120)
-    elif GAME_RESOLUTION == (320,240):
-        game.set_screen_resolution(vzd.ScreenResolution.RES_320X240)
-    elif GAME_RESOLUTION == (640,480):
-        game.set_screen_resolution(vzd.ScreenResolution.RES_640X480)
-    else:
-        print("Game resolution", GAME_RESOLUTION, "not supported")
+class DoomGame:
+    def new_episode(self):
+        self.game.new_episode()
+        self.episode_memory = []
 
-    if COLORMODE == ColorMode.GRAYSCALE:
-        game.set_screen_format(vzd.ScreenFormat.GRAY8)
-    elif COLORMODE == ColorMode.COLOR:
-        game.set_screen_format(vzd.ScreenFormat.RGB24)
-    else:
-        print("Color mode",repr(COLORMODE),"not supported.")
-    game.set_depth_buffer_enabled(USE_DEPTH_BUFFER)
-    game.set_labels_buffer_enabled(USE_LABELED_RECTS)
-    game.set_automap_buffer_enabled(False)
-    game.set_objects_info_enabled(True)
-    game.set_sectors_info_enabled(False)
+        self.goal = tf.expand_dims(tf.einsum("a,b->ab",GOAL_MEAS_COEFS,GOAL_TEMPORAL_COEFS),axis=0)
 
-    game.set_render_hud(True)
-    game.set_render_crosshair(False)
-    game.set_render_weapon(True)
-    game.set_render_decals(False)
-    game.set_render_particles(False)
-    game.set_render_effects_sprites(True)
-    game.set_render_messages(True)
-    game.set_render_corpses(True)
-    game.set_render_screen_flashes(True)
-    
-    game.set_doom_skill(4)
+        self.last_action = tf.zeros([],dtype=tf.int32)
+        self.episode_length = 0
+        self.recurrent_state = None
+        self.episode_done = False
 
-    for button in action_list.flattened:
-        game.add_available_button(button)
+    def __init__(self,mode):
+        game = vzd.DoomGame()
+        game.set_doom_scenario_path(WAD_NAME)
+        game.set_doom_map(MAP_NAME)
         
-    for measurement in VIZDOOM_VARS:
-        game.add_available_game_variable(measurement)
+        #TODO: add more resolutions
+        if GAME_RESOLUTION == (160,120):
+            game.set_screen_resolution(vzd.ScreenResolution.RES_160X120)
+        elif GAME_RESOLUTION == (320,240):
+            game.set_screen_resolution(vzd.ScreenResolution.RES_320X240)
+        elif GAME_RESOLUTION == (640,480):
+            game.set_screen_resolution(vzd.ScreenResolution.RES_640X480)
+        else:
+            print("Game resolution", GAME_RESOLUTION, "not supported")
 
-    game.set_episode_start_time(1)
-    game.set_episode_timeout(EPISODE_LENGTH)
-    game.set_window_visible(True)
-    game.set_sound_enabled(False)
-    game.set_living_reward(-1)
-    game.set_mode(mode)
-    game.init()
+        if COLORMODE == ColorMode.GRAYSCALE:
+            game.set_screen_format(vzd.ScreenFormat.GRAY8)
+        elif COLORMODE == ColorMode.COLOR:
+            game.set_screen_format(vzd.ScreenFormat.RGB24)
+        else:
+            print("Color mode",repr(COLORMODE),"not supported.")
+        game.set_depth_buffer_enabled(USE_DEPTH_BUFFER)
+        game.set_labels_buffer_enabled(USE_LABELED_RECTS)
+        game.set_automap_buffer_enabled(False)
+        game.set_objects_info_enabled(True)
+        game.set_sectors_info_enabled(False)
+
+        game.set_render_hud(True)
+        game.set_render_crosshair(False)
+        game.set_render_weapon(True)
+        game.set_render_decals(False)
+        game.set_render_particles(False)
+        game.set_render_effects_sprites(True)
+        game.set_render_messages(True)
+        game.set_render_corpses(True)
+        game.set_render_screen_flashes(True)
+        
+        game.set_doom_skill(4)
+
+        for button in action_list.flattened:
+            game.add_available_button(button)
+            
+        for measurement in VIZDOOM_VARS:
+            game.add_available_game_variable(measurement)
+
+        game.set_episode_start_time(1)
+        game.set_episode_timeout(EPISODE_LENGTH)
+        game.set_window_visible(False)
+        game.set_sound_enabled(False)
+        game.set_living_reward(-1)
+        game.set_mode(mode)
+        game.init()
+        self.game = game
     
 class DoomModel(tf.keras.Model):
     def __init__(self, filename):
@@ -253,8 +272,7 @@ dm = DoomModel(sys.argv[1])
 
 memories = Memories(memory_size=MEMORY_SIZE)
 
-game = vzd.DoomGame()
-init(game,vzd.Mode.PLAYER)
+games = [DoomGame(vzd.Mode.PLAYER) for _ in range(N_VIZDOOM_INSTANCES)]
 
 #TODO: implement learning rate schedule
 optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4, beta_1=0.95, beta_2=0.999, epsilon=1e-4)
@@ -325,7 +343,7 @@ epsilon_func = lambda step: (0.02 + 145000. / (float(step) + 150000.))
 
 #one step of the network
 #returns the action chosen
-def one_step(game, last_action, episode_memory=None, epsilon=None, in_recurrent=None):
+def one_step(game, last_action, episode_memory=None, epsilon=None, in_recurrent=None, goal=None):
     state = game.get_state()
 
     screen_buf = state.screen_buffer
@@ -395,50 +413,73 @@ test_state_counter=0
 added_states=0
 startstate = states
 starttime = time.time()
-while True:
-    game.new_episode()
-    episode_memory = []
-    goal = tf.expand_dims(tf.einsum("a,b->ab",GOAL_MEAS_COEFS,GOAL_TEMPORAL_COEFS),axis=0)
-    last_action = tf.zeros([],dtype=tf.int32)
-    episode_length = 0
-    
-    recurrent_state = None
-    
-    while not game.is_episode_finished():
-        epsilon = epsilon_func(states+episode_length)
-        game_state, last_action,recurrent_state = one_step(game,last_action,episode_memory,epsilon,recurrent_state)
-        episode_length += 1
-        
-        if game.is_player_dead():
-            break
-        
-        game.advance_action(FRAMESKIP)
-        
-    assert(episode_length == len(episode_memory))
-    states += episode_length
-    added_states += episode_length
-    test_state_counter += episode_length
 
-    player_died = game.is_player_dead()
+def game_thread(game):
+    epsilon = epsilon_func(states+game.episode_length)
+    _, game.last_action,game.recurrent_state = one_step(game.game,game.last_action,game.episode_memory,epsilon,game.recurrent_state,goal=game.goal)
+    game.episode_length += 1
     
-    #create targets for each timestep and add memory to memories
-    meas_memory = np.ndarray(shape=(len(episode_memory),N_GOAL_TIMES,N_MEASUREMENTS))
-    for i in range(len(episode_memory)):
-        mem = episode_memory[i]
-        for i2 in range(len(GOAL_TIMES)):
-            t = GOAL_TIMES[i2]
+    if game.game.is_player_dead():
+        game.episode_done = True
+        return
+    if not game.episode_done:
+        game.game.advance_action(FRAMESKIP)
+    
+
+while True:
+    for game in games:
+        game.new_episode()
+
+    while True:
+        all_done = np.all([game.episode_done for game in games])
+        if all_done:
+            break
+    
+        for game in games:
+            if game.game.is_episode_finished():
+                game.episode_done = True
+                continue
+        
+        thread_list = []
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=N_VIZDOOM_INSTANCES) as executor:
+            executor.map(game_thread, games)
+        
+        #for game in games:
+        #    new_t = threading.Thread(target=game_thread, args=(game,))
+        #    new_t.start()
+        #    thread_list.append(new_t)
+            
+            
+        #for t in thread_list:
+        #    t.join()
+        
+        
+    for game in games:
+        assert(game.episode_length == len(game.episode_memory))
+        states += game.episode_length
+        added_states += game.episode_length
+        test_state_counter += game.episode_length
+
+        player_died = game.game.is_player_dead()
+        
+        #create targets for each timestep and add memory to memories
+        meas_memory = np.ndarray(shape=(len(game.episode_memory),N_GOAL_TIMES,N_MEASUREMENTS))
+        gt = np.asarray(GOAL_TIMES,dtype=np.int32)
+        for i in range(meas_memory.shape[0]):
+            ts = gt + i
             #hack: if the player died, continue the last state forever to indicate theres nothing you can do after you die
             if player_died:
-                future_timestep = min(i+t,len(episode_memory)-1)
-            else:
-                future_timestep = i+t
-            if future_timestep < len(episode_memory):
-                meas_memory[i,i2] = episode_memory[future_timestep][1].numpy()
-            else:
-                #hack: target less than -1 million means the target doesn't exist
-                #      i tried using NaN for this but failed for whatever reason
-                meas_memory[i,i2] = [-2000000.0]*N_MEASUREMENTS
-    memories.add(episode_memory,meas_memory)
+                ts = np.minimum(ts,meas_memory.shape[0]-1)
+                
+            #hack: target less than -1 million means the target doesn't exist
+            #      i tried using NaN for this but failed for whatever reason
+            meas_memory[i] = [-2000000.0]*N_MEASUREMENTS
+            for i2 in range(meas_memory.shape[1]):
+                t = ts[i2]
+                if t < meas_memory.shape[0]:
+                    meas_memory[i,i2] = game.episode_memory[t][1].numpy()
+        memories.add(game.episode_memory,meas_memory)
     
     #train with memories
     if TRAINING_TYPE == TrainingType.EXPERIENCE_REPLAY:
@@ -455,29 +496,27 @@ while True:
         
     if test_state_counter >= TEST_FREQUENCY:
         test_state_counter -= TEST_FREQUENCY
+        game = games[0] #test with the first instance
         game.new_episode()
-        goal = tf.expand_dims(tf.einsum("a,b->ab",GOAL_MEAS_COEFS,GOAL_TEMPORAL_COEFS),axis=0)
-        last_action = tf.zeros([],dtype=tf.int32)
-        episode_length = 0
-        while not game.is_episode_finished():
-            game_state, last_action, _ = one_step(game, last_action)
+        while not game.game.is_episode_finished():
+            game_state, game.last_action, _ = one_step(game.game, game.last_action, goal=game.goal)
         
-            episode_length += 1
-            if game.is_player_dead():
+            game.episode_length += 1
+            if game.game.is_player_dead():
                 break
 
-            game.advance_action(FRAMESKIP)
+            game.game.advance_action(FRAMESKIP)
             
-        print(states, "steps seen,", [x(game, game_state) for x in MEAS],", survived for", episode_length, "steps,", (states-startstate)*1./(time.time()-starttime)," steps/s")
+        print(states, "steps seen,", [x(game.game, game_state) for x in MEAS],", survived for", game.episode_length, "steps,", (states-startstate)*1./(time.time()-starttime)," steps/s")
         startstate = states
         starttime = time.time()
         with open("training_"+sys.argv[1]+".log.txt","a") as file:
-           file.write("{0} {1} {2}\n".format(states, [x(game, game_state) for x in MEAS], episode_length))
+           file.write("{0} {1} {2}\n".format(states, [x(game.game, game_state) for x in MEAS], game.episode_length))
            
         #TODO: implement model saving!
 
 
-game.close()
+game.game.close()
 
 """
 idea for additional data point:
