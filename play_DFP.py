@@ -27,8 +27,8 @@ PREDICT_ONLY_DELTAS = True
 #RANDOM_CHOICE_TYPE = RandomChoiceType.UNIFORM
 RANDOM_CHOICE_TYPE = RandomChoiceType.SOFTMAX
 
-#TRAINING_TYPE = TrainingType.EXPERIENCE_REPLAY
-TRAINING_TYPE = TrainingType.FULL_EPISODES
+TRAINING_TYPE = TrainingType.EXPERIENCE_REPLAY
+#TRAINING_TYPE = TrainingType.FULL_EPISODES
 #TRAINING_TYPE = TrainingType.FULL_EPISODES_RECURRENT
 
 FRAMESKIP = 4
@@ -63,7 +63,6 @@ GOAL_MEAS_COEFS = tf.convert_to_tensor(GOAL_MEAS_COEFS,dtype=tf.float32)
 MEAS_PREPROCESS_COEFS = tf.convert_to_tensor(MEAS_PREPROCESS_COEFS,dtype=tf.float32)
 MEAS_POSTPROCESS_COEFS = tf.convert_to_tensor(MEAS_POSTPROCESS_COEFS,dtype=tf.float32)
 MEAS_MASK = tf.expand_dims(tf.convert_to_tensor([t != MeasType.DELTA for t in MEAS_TYPES],dtype=tf.float32),axis=0)
-
 
 def init(game,mode):
     game.set_doom_scenario_path(WAD_NAME)
@@ -263,7 +262,11 @@ optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4, beta_1=0.95, beta_2=0.9
 @tf.function
 def train_func(screen_buf,gamevars,goal,actions,last_actions,targets,padding_mask):
     with tf.GradientTape() as tape:
-        out,_ = dm(screen_buf,gamevars,goal,last_actions,tf.cast(padding_mask,tf.bool))
+        if padding_mask is None:
+            out,_ = dm(screen_buf,gamevars,goal,last_actions)
+        else:
+            out,_ = dm(screen_buf,gamevars,goal,last_actions,tf.cast(padding_mask,tf.bool))
+        
         consec = tf.range(actions.shape[0])
         total = tf.stack([consec,actions],axis=-1)
         out2 = tf.gather_nd(out,total)
@@ -273,9 +276,11 @@ def train_func(screen_buf,gamevars,goal,actions,last_actions,targets,padding_mas
         loss = tf.where(targets < -1000000.0,tf.zeros_like(out2),tf.square(targets-out2))
         if padding_mask is not None:
             loss = tf.multiply(loss,tf.reshape(padding_mask,[padding_mask.shape[0],1,1]))
-
+    
     gradients = tape.gradient(loss, dm.trainable_variables)
     optimizer.apply_gradients(zip(gradients, dm.trainable_variables))
+    
+    return loss,out2
 
 def get_padded_length(n):
     lengths = [150,200,300,400,600,800,1200,1600]
@@ -315,7 +320,6 @@ def train(eps, targets):
         padding_mask = pad_tensor_to_len(tf.ones(original_len,dtype=tf.float32),padded_len)
     
     train_func(screen_buf,gamevars,goal,actions,last_actions,targets,padding_mask)
-    
 
 epsilon_func = lambda step: (0.02 + 145000. / (float(step) + 150000.))
 
