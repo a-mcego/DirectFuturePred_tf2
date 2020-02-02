@@ -19,8 +19,8 @@ from DFP_helpers import *
 #---START---USER-SUPPLIED-SETTINGS---
 
 #these are scenarios, pick one.
-from d1_basic import *
-#from playdoom import *
+#from d1_basic import *
+from playdoom import *
 
 #with this, the network only predicts how much the measurements have changed
 #and not the measurements themselves
@@ -46,7 +46,7 @@ MEMORY_FULL_STRATEGY = MemoryFullStrategy.DELETE_EVERY_OTHER
 USE_GOAL_INPUT = False
 
 #shall we input the last action made to the new timestep?
-USE_LAST_ACTION_INPUT = True
+USE_LAST_ACTION_INPUT = False
 
 #how many ViZDoom instances we learn with?
 N_VIZDOOM_INSTANCES = 4
@@ -128,7 +128,7 @@ class DoomGame:
 
         game.set_episode_start_time(1)
         game.set_episode_timeout(EPISODE_LENGTH)
-        game.set_window_visible(False)
+        game.set_window_visible(True)
         game.set_sound_enabled(False)
         game.set_living_reward(-1)
         game.set_mode(mode)
@@ -415,6 +415,10 @@ startstate = states
 starttime = time.time()
 
 def game_thread(game):
+    if game.game.is_episode_finished():
+        game.episode_done = True
+        return
+
     epsilon = epsilon_func(states+game.episode_length)
     _, game.last_action,game.recurrent_state = one_step(game.game,game.last_action,game.episode_memory,epsilon,game.recurrent_state,goal=game.goal)
     game.episode_length += 1
@@ -425,6 +429,7 @@ def game_thread(game):
     if not game.episode_done:
         game.game.advance_action(FRAMESKIP)
     
+meas_all_memory = np.ndarray(shape=(N_VIZDOOM_INSTANCES,EPISODE_LENGTH//FRAMESKIP+1,N_GOAL_TIMES,N_MEASUREMENTS))
 
 while True:
     for game in games:
@@ -435,26 +440,10 @@ while True:
         if all_done:
             break
     
-        for game in games:
-            if game.game.is_episode_finished():
-                game.episode_done = True
-                continue
-        
-        thread_list = []
-        
         with concurrent.futures.ThreadPoolExecutor(max_workers=N_VIZDOOM_INSTANCES) as executor:
             executor.map(game_thread, games)
         
-        #for game in games:
-        #    new_t = threading.Thread(target=game_thread, args=(game,))
-        #    new_t.start()
-        #    thread_list.append(new_t)
-            
-            
-        #for t in thread_list:
-        #    t.join()
-        
-        
+    gameid=0
     for game in games:
         assert(game.episode_length == len(game.episode_memory))
         states += game.episode_length
@@ -464,39 +453,44 @@ while True:
         player_died = game.game.is_player_dead()
         
         #create targets for each timestep and add memory to memories
-        meas_memory = np.ndarray(shape=(len(game.episode_memory),N_GOAL_TIMES,N_MEASUREMENTS))
+        #meas_memory = np.ndarray(shape=(game.episode_length,N_GOAL_TIMES,N_MEASUREMENTS))
+        meas_memory = meas_all_memory[gameid]
+        
         gt = np.asarray(GOAL_TIMES,dtype=np.int32)
-        for i in range(meas_memory.shape[0]):
+        for i in range(game.episode_length):
             ts = gt + i
             #hack: if the player died, continue the last state forever to indicate theres nothing you can do after you die
             if player_died:
-                ts = np.minimum(ts,meas_memory.shape[0]-1)
+                ts = np.minimum(ts,game.episode_length-1)
                 
             #hack: target less than -1 million means the target doesn't exist
             #      i tried using NaN for this but failed for whatever reason
-            meas_memory[i] = [-2000000.0]*N_MEASUREMENTS
+            meas_memory[i] = -2000000.0
             for i2 in range(meas_memory.shape[1]):
                 t = ts[i2]
-                if t < meas_memory.shape[0]:
+                if t < game.episode_length:
                     meas_memory[i,i2] = game.episode_memory[t][1].numpy()
-        memories.add(game.episode_memory,meas_memory)
+                    
+        memories.add(game.episode_memory,np.array(meas_memory[:game.episode_length],copy=True))
+        
+        gameid += 1
     
-    #train with memories
-    if TRAINING_TYPE == TrainingType.EXPERIENCE_REPLAY:
-        while added_states >= BATCH_SIZE:
-            ep, tgt = memories.get_random_memories(BATCH_SIZE)
+        #train with memories
+        if TRAINING_TYPE == TrainingType.EXPERIENCE_REPLAY:
+            while added_states >= BATCH_SIZE:
+                ep, tgt = memories.get_random_memories(BATCH_SIZE)
+                train(ep, tgt)
+                added_states -= BATCH_SIZE
+        elif TRAINING_TYPE == TrainingType.FULL_EPISODES or TRAINING_TYPE == TrainingType.FULL_EPISODES_RECURRENT:
+            ep, tgt = memories.get_all_memories()
             train(ep, tgt)
-            added_states -= BATCH_SIZE
-    elif TRAINING_TYPE == TrainingType.FULL_EPISODES or TRAINING_TYPE == TrainingType.FULL_EPISODES_RECURRENT:
-        ep, tgt = memories.get_all_memories()
-        train(ep, tgt)
-        memories.clear()
-    else:
-        print("Training type",repr(TRAINING_TYPE),"not supported")
+            memories.clear()
+        else:
+            print("Training type",repr(TRAINING_TYPE),"not supported")
         
     if test_state_counter >= TEST_FREQUENCY:
         test_state_counter -= TEST_FREQUENCY
-        game = games[0] #test with the first instance
+        """game = games[0] #test with the first instance
         game.new_episode()
         while not game.game.is_episode_finished():
             game_state, game.last_action, _ = one_step(game.game, game.last_action, goal=game.goal)
@@ -506,12 +500,14 @@ while True:
                 break
 
             game.game.advance_action(FRAMESKIP)
-            
-        print(states, "steps seen,", [x(game.game, game_state) for x in MEAS],", survived for", game.episode_length, "steps,", (states-startstate)*1./(time.time()-starttime)," steps/s")
+        print(states, "steps seen,", [x(game.game, game_state) for x in MEAS],", survived for", game.episode_length, "steps,", (states-startstate)*1./(time.time()-starttime)," steps/s")"""
+        
+        print(states, "steps seen,", (states-startstate)*1./(time.time()-starttime)," steps/s")
+        
         startstate = states
         starttime = time.time()
-        with open("training_"+sys.argv[1]+".log.txt","a") as file:
-           file.write("{0} {1} {2}\n".format(states, [x(game.game, game_state) for x in MEAS], game.episode_length))
+        """with open("training_"+sys.argv[1]+".log.txt","a") as file:
+           file.write("{0} {1} {2}\n".format(states, [x(game.game, game_state) for x in MEAS], game.episode_length))"""
            
         #TODO: implement model saving!
 
