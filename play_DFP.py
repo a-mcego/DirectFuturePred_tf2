@@ -1,6 +1,8 @@
 from __future__ import print_function
 import vizdoom as vzd
 from matplotlib import pyplot as plt
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import tensorflow as tf
 from random import choice
 import time
@@ -13,14 +15,14 @@ import concurrent.futures
 if len(sys.argv) != 2:
     print("Give logfile name as argument.")
     exit(0)
-
+    
 from DFP_helpers import *
 
 #---START---USER-SUPPLIED-SETTINGS---
 
 #these are scenarios, pick one.
-#from d1_basic import *
-from playdoom import *
+from d1_basic import *
+#from playdoom import *
 
 #with this, the network only predicts how much the measurements have changed
 #and not the measurements themselves
@@ -29,17 +31,17 @@ PREDICT_ONLY_DELTAS = True
 #RANDOM_CHOICE_TYPE = RandomChoiceType.UNIFORM
 RANDOM_CHOICE_TYPE = RandomChoiceType.SOFTMAX
 
-TRAINING_TYPE = TrainingType.EXPERIENCE_REPLAY
-#TRAINING_TYPE = TrainingType.FULL_EPISODES
+#TRAINING_TYPE = TrainingType.EXPERIENCE_REPLAY
+TRAINING_TYPE = TrainingType.FULL_EPISODES
 #TRAINING_TYPE = TrainingType.FULL_EPISODES_RECURRENT
 
 FRAMESKIP = 4
 BATCH_SIZE = 64 #how many steps in one batch of training the network
 MEMORY_SIZE = 20000 #how many steps we keep in the experience memory
-TEST_FREQUENCY = 2500 #how often we test the network, in steps trained
+TEST_FREQUENCY = 5000 #how often we test the network, in steps trained
 
-#MEMORY_FULL_STRATEGY = MemoryFullStrategy.DELETE_OLDEST
-MEMORY_FULL_STRATEGY = MemoryFullStrategy.DELETE_EVERY_OTHER
+MEMORY_FULL_STRATEGY = MemoryFullStrategy.DELETE_OLDEST
+#MEMORY_FULL_STRATEGY = MemoryFullStrategy.DELETE_EVERY_OTHER
 
 #having goal as an input to the network seems to be unnecessary.
 #here's a way to turn it off! :)
@@ -49,10 +51,11 @@ USE_GOAL_INPUT = False
 USE_LAST_ACTION_INPUT = False
 
 #how many ViZDoom instances we learn with?
-N_VIZDOOM_INSTANCES = 4
+N_VIZDOOM_INSTANCES = 1
 
 #---END---USER-SUPPLIED-SETTINGS---
 
+N_INPUT_FEATURE_MAPS = (1 if COLORMODE == ColorMode.GRAYSCALE else 0) + (3 if COLORMODE == ColorMode.COLOR else 0) + (1 if USE_DEPTH_BUFFER else 0) + (1 if USE_LABELED_RECTS else 0)
 N_GOAL_TIMES = len(GOAL_TIMES)
 MEAS_POSTPROCESS_COEFS = [1.0/x for x in MEAS_PREPROCESS_COEFS]
 N_MEASUREMENTS = len(MEAS)
@@ -69,6 +72,53 @@ MEAS_PREPROCESS_COEFS = tf.convert_to_tensor(MEAS_PREPROCESS_COEFS,dtype=tf.floa
 MEAS_POSTPROCESS_COEFS = tf.convert_to_tensor(MEAS_POSTPROCESS_COEFS,dtype=tf.float32)
 MEAS_MASK = tf.expand_dims(tf.convert_to_tensor([t != MeasType.DELTA for t in MEAS_TYPES],dtype=tf.float32),axis=0)
 
+class Episode:
+    def __init__(self, size):
+        print("Init Episode size",size)
+        self.total_size = size
+        self.current_size = 0
+        self.screen_buf = np.zeros(shape=(size,SCALED_RESOLUTION[1],SCALED_RESOLUTION[0],N_INPUT_FEATURE_MAPS),dtype=np.float32)
+        self.gamevars = np.zeros(shape=(size,N_MEASUREMENTS),dtype=np.float32)
+        self.goal = np.zeros(shape=(size,N_MEASUREMENTS,N_GOAL_TIMES),dtype=np.float32)
+        self.chosen_action = np.zeros(shape=(size),dtype=np.int32)
+        self.last_action = np.zeros(shape=(size),dtype=np.int32)
+        
+        self.targets = np.zeros(shape=(EPISODE_LENGTH//FRAMESKIP+1,N_GOAL_TIMES,N_MEASUREMENTS),dtype=np.float32)
+    
+    def new_episode(self):
+        self.current_size = 0
+        
+    def add(self, screen_buf,gamevars,goal,chosen_action,last_action):
+    
+        self.screen_buf[self.current_size] = np.squeeze(screen_buf,axis=0)
+        self.gamevars[self.current_size] = np.squeeze(gamevars,axis=0)
+        self.goal[self.current_size] = np.squeeze(goal,axis=0)
+        self.chosen_action[self.current_size] = chosen_action
+        self.last_action[self.current_size] = last_action
+
+        self.current_size += 1
+
+    def make_targets(self, player_died):
+        gt = np.asarray(GOAL_TIMES,dtype=np.int32)
+        for i in range(self.current_size):
+            ts = gt + i
+            #hack: if the player died, continue the last state forever to indicate theres nothing you can do after you die
+            if player_died:
+                ts = np.minimum(ts,self.current_size-1)
+                
+            #hack: target less than -1 million means the target doesn't exist
+            #      i tried using NaN for this but failed for whatever reason
+            self.targets[i] = -2000000.0
+            for i2 in range(self.targets.shape[1]):
+                t = ts[i2]
+                if t < self.current_size:
+                    self.targets[i,i2] = self.gamevars[t]
+        return self.targets[:self.current_size]
+
+    #pad the current data with zeros, in the timesteps [current_size,n)
+    def pad(self, n):
+        pass#TODO
+
 class DoomGame:
     def new_episode(self):
         self.game.new_episode()
@@ -80,6 +130,9 @@ class DoomGame:
         self.episode_length = 0
         self.recurrent_state = None
         self.episode_done = False
+        
+        self.episode_memory2.new_episode()
+        
 
     def __init__(self,mode):
         game = vzd.DoomGame()
@@ -134,6 +187,7 @@ class DoomGame:
         game.set_mode(mode)
         game.init()
         self.game = game
+        self.episode_memory2 = Episode(EPISODE_LENGTH//FRAMESKIP+1)
     
 class DoomModel(tf.keras.Model):
     def __init__(self, filename):
@@ -224,6 +278,93 @@ class DoomModel(tf.keras.Model):
 
         return total,ret_state
 
+class Memories2:
+    def __init__(self, size):
+        print("Init Memory size",size)
+        self.total_size = size
+        self.current_size = 0
+        self.screen_buf = np.zeros(shape=(size,SCALED_RESOLUTION[1],SCALED_RESOLUTION[0],N_INPUT_FEATURE_MAPS),dtype=np.float32)
+        self.gamevars = np.zeros(shape=(size,N_MEASUREMENTS),dtype=np.float32)
+        self.goal = np.zeros(shape=(size,N_MEASUREMENTS,N_GOAL_TIMES),dtype=np.float32)
+        self.chosen_action = np.zeros(shape=(size),dtype=np.int32)
+        self.last_action = np.zeros(shape=(size),dtype=np.int32)
+        
+        self.targets = np.zeros(shape=(size,N_GOAL_TIMES,N_MEASUREMENTS),dtype=np.float32)
+        
+    def clear(self):
+        self.current_size = 0
+        
+    def crop(self, tensor, crop_start,oldsize):
+        cropped_tensor = tensor[crop_start:oldsize]
+        cropped_size = cropped_tensor.shape[0]
+        tensor[:cropped_size] = cropped_tensor
+        self.current_size = cropped_size
+        
+    def take_every_other(self, tensor, oldsize):
+        cropped_tensor = tensor[:oldsize:2]
+        cropped_size = cropped_tensor.shape[0]
+        tensor[:cropped_size] = cropped_tensor
+        self.current_size = cropped_size
+        
+    def append(self, tensor, moredata, moredata_len):
+        #TODO: should we copy this? probably.
+        tensor[self.current_size:self.current_size+moredata_len] = np.array(moredata[:moredata_len],copy=True)
+
+    def add_episode(self, episode, targets):
+        newsize = self.current_size+episode.current_size
+    
+        if newsize > self.total_size:
+            oldsize = self.current_size
+            if MEMORY_FULL_STRATEGY == MemoryFullStrategy.DELETE_OLDEST:
+                crop_start = newsize - self.total_size
+                self.crop(self.screen_buf,crop_start,oldsize)
+                self.crop(self.gamevars,crop_start,oldsize)
+                self.crop(self.goal,crop_start,oldsize)
+                self.crop(self.chosen_action,crop_start,oldsize)
+                self.crop(self.last_action,crop_start,oldsize)
+                self.crop(self.targets,crop_start,oldsize)
+            elif MEMORY_FULL_STRATEGY == MemoryFullStrategy.DELETE_EVERY_OTHER:
+                self.take_every_other(self.screen_buf,oldsize)
+                self.take_every_other(self.gamevars,oldsize)
+                self.take_every_other(self.goal,oldsize)
+                self.take_every_other(self.chosen_action,oldsize)
+                self.take_every_other(self.last_action,oldsize)
+                self.take_every_other(self.targets,oldsize)
+            else:
+                print("MemoryFullStrategy",repr(MEMORY_FULL_STRATEGY),"not supported.")
+                
+        #hack: there is an assumption here that after the memory full strategy
+        #      has been executed, there *definitely is* room for the new memories
+        
+        self.append(self.screen_buf, episode.screen_buf, episode.current_size)
+        self.append(self.gamevars, episode.gamevars, episode.current_size)
+        self.append(self.goal, episode.goal, episode.current_size)
+        self.append(self.chosen_action, episode.chosen_action, episode.current_size)
+        self.append(self.last_action, episode.last_action, episode.current_size)
+        self.append(self.targets, targets, episode.current_size)
+        self.current_size += episode.current_size
+
+    def get_random_memories(self, n, indices):
+        screen_buf = self.screen_buf[indices]
+        gamevars = self.gamevars[indices]
+        goal = self.goal[indices]
+        chosen_action = self.chosen_action[indices]
+        last_action = self.last_action[indices]
+        targets = self.targets[indices]
+        return screen_buf, gamevars, goal, chosen_action, last_action, targets
+        
+    def get_all_memories(self):
+        screen_buf = self.screen_buf[:self.current_size]
+        gamevars = self.gamevars[:self.current_size]
+        goal = self.goal[:self.current_size]
+        chosen_action = self.chosen_action[:self.current_size]
+        last_action = self.last_action[:self.current_size]
+        targets = self.targets[:self.current_size]
+        return screen_buf, gamevars, goal, chosen_action, last_action, targets
+        
+        
+     
+
 class Memories:
     def __init__(self, memory_size):
         self.mem_episode = []
@@ -232,15 +373,10 @@ class Memories:
     
     def get_current_len(self):
         return len(self.mem_episode)
-
+        
     def add(self,episode,targets):
         assert(len(episode) == len(targets))
-        #print("Adding!", len(episode), len(targets))
-        self.mem_episode.extend(episode)
-        self.mem_targets.extend(targets)
-        
-        newlen = len(self.mem_episode)
-        
+        newlen = len(self.mem_episode)+len(episode)
         if newlen > MEMORY_SIZE:
             if MEMORY_FULL_STRATEGY == MemoryFullStrategy.DELETE_OLDEST:
                 crop = newlen - MEMORY_SIZE
@@ -251,9 +387,12 @@ class Memories:
                 self.mem_targets = self.mem_targets[::2]
             else:
                 print("MemoryFullStrategy",repr(MEMORY_FULL_STRATEGY),"not supported.")
+
+        self.mem_episode.extend(episode)
+        self.mem_targets.extend(targets)
         
-    def get_random_memories(self, n):
-        indices = np.random.randint(self.get_current_len(), size=(n))
+    def get_random_memories(self, n, indices):
+        
         
         rand_episode = [self.mem_episode[i] for i in indices]
         rand_targets = [self.mem_targets[i] for i in indices]
@@ -267,10 +406,12 @@ class Memories:
         self.mem_episode = []
         self.mem_targets = []  
         
+        
 dm = DoomModel(sys.argv[1])
 #TODO: implement model loading!
 
 memories = Memories(memory_size=MEMORY_SIZE)
+memories2 = Memories2(size=MEMORY_SIZE)
 
 games = [DoomGame(vzd.Mode.PLAYER) for _ in range(N_VIZDOOM_INSTANCES)]
 
@@ -315,7 +456,7 @@ def pad_tensor_to_len(tensor, new_len):
     pad = tf.zeros(shape=([added_amount]+tensor.shape[1:]),dtype=tensor.dtype)
     return tf.concat([tensor,pad],axis=0)
 
-def train(eps, targets):
+def train(eps, targets, random_mems):
     screen_buf = tf.concat([e[0] for e in eps],axis=0)
     gamevars = tf.concat([e[1] for e in eps],axis=0)
     goal = tf.concat([e[2] for e in eps],axis=0)
@@ -323,6 +464,22 @@ def train(eps, targets):
     last_actions = tf.convert_to_tensor([e[4] for e in eps],dtype=tf.int32)
     targets = tf.cast(tf.transpose(tf.stack(targets,axis=0),perm=[0,2,1]),dtype=tf.float32)
     padding_mask = None
+    
+    screen_buf = tf.convert_to_tensor(random_mems[0],dtype=tf.float32)
+    gamevars = tf.convert_to_tensor(random_mems[1],dtype=tf.float32)
+    goal = tf.convert_to_tensor(random_mems[2],dtype=tf.float32)
+    actions = tf.convert_to_tensor(random_mems[3],dtype=tf.int32)
+    last_actions = tf.convert_to_tensor(random_mems[4],dtype=tf.int32)
+    targets = tf.convert_to_tensor(random_mems[5],dtype=tf.float32)
+    
+    targets = tf.transpose(targets,perm=[0,2,1])
+    
+    print(tf.reduce_sum(tf.square(tf.subtract(screen_buf,random_mems[0]))))
+    print(tf.reduce_sum(tf.square(tf.subtract(gamevars,random_mems[1]))))
+    print(tf.reduce_sum(tf.square(tf.subtract(goal,random_mems[2]))))
+    print(tf.reduce_sum(tf.square(tf.subtract(actions,random_mems[3]))))
+    print(tf.reduce_sum(tf.square(tf.subtract(last_actions,random_mems[4]))))
+    print(tf.reduce_sum(tf.square(tf.subtract(targets,tf.transpose(random_mems[5],perm=[0,2,1])))))
     
     if TRAINING_TYPE == TrainingType.FULL_EPISODES or TRAINING_TYPE == TrainingType.FULL_EPISODES_RECURRENT:
         original_len = actions.shape[0]
@@ -343,7 +500,12 @@ epsilon_func = lambda step: (0.02 + 145000. / (float(step) + 150000.))
 
 #one step of the network
 #returns the action chosen
-def one_step(game, last_action, episode_memory=None, epsilon=None, in_recurrent=None, goal=None):
+def one_step(game, last_action, episode_memory=None, epsilon=None, in_recurrent=None, goal=None, episode_memory2=None):
+    
+    if episode_memory is not None and episode_memory2 is None:
+        print("EPISODE ERROR")
+        exit(0)
+    
     state = game.get_state()
 
     screen_buf = state.screen_buffer
@@ -400,8 +562,13 @@ def one_step(game, last_action, episode_memory=None, epsilon=None, in_recurrent=
             else:
                 print("Random choice type",repr(RANDOM_CHOICE_TYPE),"not supported.")
 
+
+    
+
     if episode_memory is not None:
         episode_memory.append([screen_buf,gamevars,goal,chosen_action,last_action])
+        
+        episode_memory2.add(screen_buf,gamevars,goal,chosen_action,last_action)
 
     action_vector = action_list.number_to_vector(chosen_action)
     
@@ -420,7 +587,7 @@ def game_thread(game):
         return
 
     epsilon = epsilon_func(states+game.episode_length)
-    _, game.last_action,game.recurrent_state = one_step(game.game,game.last_action,game.episode_memory,epsilon,game.recurrent_state,goal=game.goal)
+    _, game.last_action,game.recurrent_state = one_step(game.game,game.last_action,game.episode_memory,epsilon,game.recurrent_state,goal=game.goal,episode_memory2 = game.episode_memory2)
     game.episode_length += 1
     
     if game.game.is_player_dead():
@@ -440,12 +607,18 @@ while True:
         if all_done:
             break
     
-        with concurrent.futures.ThreadPoolExecutor(max_workers=N_VIZDOOM_INSTANCES) as executor:
-            executor.map(game_thread, games)
+        #disable threading for debugging purposes
+        """with concurrent.futures.ThreadPoolExecutor(max_workers=N_VIZDOOM_INSTANCES) as executor:
+             executor.map(game_thread, games)"""
+        #and do this instead
+        for game in games:
+            game_thread(game)
+        
         
     gameid=0
     for game in games:
         assert(game.episode_length == len(game.episode_memory))
+        assert(game.episode_length == game.episode_memory2.current_size)
         states += game.episode_length
         added_states += game.episode_length
         test_state_counter += game.episode_length
@@ -471,20 +644,28 @@ while True:
                 if t < game.episode_length:
                     meas_memory[i,i2] = game.episode_memory[t][1].numpy()
                     
+        tgt2 = game.episode_memory2.make_targets(player_died)
+        tgt1 = meas_memory[:game.episode_length]
+        
         memories.add(game.episode_memory,np.array(meas_memory[:game.episode_length],copy=True))
+        memories2.add_episode(game.episode_memory2, tgt2)
         
         gameid += 1
     
         #train with memories
         if TRAINING_TYPE == TrainingType.EXPERIENCE_REPLAY:
             while added_states >= BATCH_SIZE:
-                ep, tgt = memories.get_random_memories(BATCH_SIZE)
-                train(ep, tgt)
+                indices = np.random.randint(memories.get_current_len(), size=(BATCH_SIZE))
+                ep, tgt = memories.get_random_memories(BATCH_SIZE, indices)
+                random_mems = memories2.get_random_memories(BATCH_SIZE, indices)
+                train(ep, tgt, random_mems)
                 added_states -= BATCH_SIZE
         elif TRAINING_TYPE == TrainingType.FULL_EPISODES or TRAINING_TYPE == TrainingType.FULL_EPISODES_RECURRENT:
             ep, tgt = memories.get_all_memories()
-            train(ep, tgt)
+            all_mems = memories2.get_all_memories()
+            train(ep, tgt, all_mems)
             memories.clear()
+            memories2.clear()
         else:
             print("Training type",repr(TRAINING_TYPE),"not supported")
         
