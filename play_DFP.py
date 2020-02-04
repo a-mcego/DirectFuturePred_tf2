@@ -21,8 +21,8 @@ from DFP_helpers import *
 #---START---USER-SUPPLIED-SETTINGS---
 
 #these are scenarios, pick one.
-from d1_basic import *
-#from playdoom import *
+#from d1_basic import *
+from playdoom import *
 
 #with this, the network only predicts how much the measurements have changed
 #and not the measurements themselves
@@ -31,27 +31,40 @@ PREDICT_ONLY_DELTAS = True
 #RANDOM_CHOICE_TYPE = RandomChoiceType.UNIFORM
 RANDOM_CHOICE_TYPE = RandomChoiceType.SOFTMAX
 
-TRAINING_TYPE = TrainingType.EXPERIENCE_REPLAY
+#TRAINING_TYPE = TrainingType.EXPERIENCE_REPLAY
 #TRAINING_TYPE = TrainingType.FULL_EPISODES
-#TRAINING_TYPE = TrainingType.FULL_EPISODES_RECURRENT
+TRAINING_TYPE = TrainingType.FULL_EPISODES_RECURRENT
 
 FRAMESKIP = 4
 BATCH_SIZE = 64 #how many steps in one batch of training the network
-MEMORY_SIZE = 20000 #how many steps we keep in the experience memory
+MEMORY_SIZE = 4000 #how many steps we keep in the experience memory
+                   #only for TrainingType.EXPERIENCE_REPLAY!
 TEST_FREQUENCY = 10000 #how often we test the network, in steps trained
 
-MEMORY_FULL_STRATEGY = MemoryFullStrategy.DELETE_OLDEST
-#MEMORY_FULL_STRATEGY = MemoryFullStrategy.DELETE_EVERY_OTHER
+#what do we do when the experience memory is full?
+#only for TrainingType.EXPERIENCE_REPLAY!
+#MEMORY_FULL_STRATEGY = MemoryFullStrategy.DELETE_OLDEST
+MEMORY_FULL_STRATEGY = MemoryFullStrategy.DELETE_EVERY_OTHER
 
 #having goal as an input to the network seems to be unnecessary.
 #here's a way to turn it off! :)
 USE_GOAL_INPUT = False
 
 #shall we input the last action made to the new timestep?
-USE_LAST_ACTION_INPUT = False
+USE_LAST_ACTION_INPUT = True
 
 #how many ViZDoom instances we learn with?
 N_VIZDOOM_INSTANCES = 4
+
+#show the ViZDoom window while training?
+TRAINING_WINDOW_VISIBLE = False
+
+#show the ViZDoom window while testing?
+TESTING_WINDOW_VISIBLE = True
+
+#shall we test every TEST_FREQUENCY steps? (True)
+#or just output speed and steps trained? (False)
+DO_TESTING = True
 
 #---END---USER-SUPPLIED-SETTINGS---
 
@@ -84,6 +97,8 @@ class Episode:
         self.last_action = np.zeros(shape=(size),dtype=np.int32)
         
         self.targets = np.zeros(shape=(EPISODE_LENGTH//FRAMESKIP+1,N_GOAL_TIMES,N_MEASUREMENTS),dtype=np.float32)
+        
+        self.gt = np.asarray(GOAL_TIMES,dtype=np.int32) #used in self.make_targets()
     
     def new_episode(self):
         self.current_size = 0
@@ -99,17 +114,22 @@ class Episode:
         self.current_size += 1
 
     def make_targets(self, player_died):
-        gt = np.asarray(GOAL_TIMES,dtype=np.int32)
-        for i in range(self.current_size):
-            ts = gt + i
-            #hack: if the player died, continue the last state forever to indicate theres nothing you can do after you die
-            if player_died:
-                ts = np.minimum(ts,self.current_size-1)
-                
-            #hack: target less than -1 million means the target doesn't exist
-            #      i tried using NaN for this but failed for whatever reason
-            self.targets[i] = np.where(np.expand_dims(ts < self.current_size,axis=-1), self.gamevars[ts], -2000000.0)
-
+        #hack: if the player died, continue the last state forever to indicate theres nothing you can do after you die
+        if player_died:
+            for i in range(self.current_size):
+                ts_min = np.minimum(self.gt + i,self.current_size-1)
+                self.targets[i] = self.gamevars[ts_min]
+        else:
+            for i in range(self.current_size):
+                #we need both ts and ts_min because in np.where we have to index into
+                #self.gamevars before actually knowing whether the index is valid
+                ts = self.gt + i
+                ts_min = np.minimum(ts,self.current_size-1)
+                #hack: target less than -1 million means the target doesn't exist
+                #      i tried using NaN for this but failed for whatever reason
+                self.targets[i] = np.where(np.expand_dims(ts < self.current_size,axis=-1), self.gamevars[ts_min], -2000000.0)
+        
+    def get_targets(self):
         return self.targets[:self.current_size]
 
     #pad the current data with zeros, in the timesteps [current_size,n)
@@ -127,10 +147,10 @@ class DoomGame:
         self.recurrent_state = None
         self.episode_done = False
         
-        self.episode_memory2.new_episode()
+        self.episode_memory.new_episode()
         
 
-    def __init__(self,mode):
+    def __init__(self,mode, is_testing):
         game = vzd.DoomGame()
         game.set_doom_scenario_path(WAD_NAME)
         game.set_doom_map(MAP_NAME)
@@ -177,13 +197,16 @@ class DoomGame:
 
         game.set_episode_start_time(1)
         game.set_episode_timeout(EPISODE_LENGTH)
-        game.set_window_visible(True)
+        if is_testing:
+            game.set_window_visible(TESTING_WINDOW_VISIBLE)
+        else:
+            game.set_window_visible(TRAINING_WINDOW_VISIBLE)
         game.set_sound_enabled(False)
         game.set_living_reward(-1)
         game.set_mode(mode)
         game.init()
         self.game = game
-        self.episode_memory2 = Episode(EPISODE_LENGTH//FRAMESKIP+1)
+        self.episode_memory = Episode(EPISODE_LENGTH//FRAMESKIP+1)
     
 class DoomModel(tf.keras.Model):
     def __init__(self, filename):
@@ -211,6 +234,7 @@ class DoomModel(tf.keras.Model):
         
         if TRAINING_TYPE == TrainingType.FULL_EPISODES_RECURRENT:
             self.lstm1 = tf.keras.layers.LSTM(512,return_sequences=True,return_state=True)
+            self.lstm1.could_use_cudnn = False
 
         self.action1 = tf.keras.layers.Dense(512, activation=self.lrelu)
         self.action2 = tf.keras.layers.Dense(N_MEASUREMENTS*N_GOAL_TIMES*N_ACTIONS)
@@ -306,7 +330,7 @@ class Memories:
         #TODO: should we copy this? probably.
         tensor[self.current_size:self.current_size+moredata_len] = np.array(moredata[:moredata_len],copy=True)
 
-    def add_episode(self, episode, targets):
+    def add_episode(self, episode):
         newsize = self.current_size+episode.current_size
     
         if newsize > self.total_size:
@@ -337,7 +361,7 @@ class Memories:
         self.append(self.goal, episode.goal, episode.current_size)
         self.append(self.chosen_action, episode.chosen_action, episode.current_size)
         self.append(self.last_action, episode.last_action, episode.current_size)
-        self.append(self.targets, targets, episode.current_size)
+        self.append(self.targets, episode.targets, episode.current_size)
         self.current_size += episode.current_size
 
     def get_random_memories(self, n):
@@ -364,27 +388,15 @@ dm = DoomModel(sys.argv[1])
 
 memories = Memories(size=MEMORY_SIZE)
 
-games = [DoomGame(vzd.Mode.PLAYER) for _ in range(N_VIZDOOM_INSTANCES)]
+games = [DoomGame(vzd.Mode.PLAYER,False) for _ in range(N_VIZDOOM_INSTANCES)]
+
+testgame = DoomGame(vzd.Mode.PLAYER,True)
 
 #TODO: implement learning rate schedule
 optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4, beta_1=0.95, beta_2=0.999, epsilon=1e-4)
 
 @tf.function
-def train_func(screen_buf,gamevars,goal,actions,last_actions,targets):
-    padding_mask = None
-    if TRAINING_TYPE == TrainingType.FULL_EPISODES or TRAINING_TYPE == TrainingType.FULL_EPISODES_RECURRENT:
-        original_len = actions.shape[0]
-        padded_len = get_padded_length(original_len)
-        
-        #this is ugly repetitive code, wonder if there's a better way
-        screen_buf = pad_tensor_to_len(screen_buf, padded_len)
-        gamevars = pad_tensor_to_len(gamevars, padded_len)
-        goal = pad_tensor_to_len(goal, padded_len)
-        actions = pad_tensor_to_len(actions, padded_len)
-        last_actions = pad_tensor_to_len(last_actions, padded_len)
-        targets = pad_tensor_to_len(targets, padded_len)
-        padding_mask = pad_tensor_to_len(tf.ones(original_len,dtype=tf.float32),padded_len)
-
+def train_func(screen_buf,gamevars,goal,actions,last_actions,targets,padding_mask):
     with tf.GradientTape() as tape:
         if padding_mask is None:
             out,_ = dm(screen_buf,gamevars,goal,last_actions)
@@ -430,13 +442,27 @@ def train(mems):
     targets = tf.convert_to_tensor(mems[5],dtype=tf.float32)
     targets = tf.transpose(targets,perm=[0,2,1])
     
-    train_func(screen_buf,gamevars,goal,actions,last_actions,targets)
+    padding_mask = None
+    if TRAINING_TYPE == TrainingType.FULL_EPISODES or TRAINING_TYPE == TrainingType.FULL_EPISODES_RECURRENT:
+        original_len = actions.shape[0]
+        padded_len = get_padded_length(original_len)
+        
+        #this is ugly repetitive code, wonder if there's a better way
+        screen_buf = pad_tensor_to_len(screen_buf, padded_len)
+        gamevars = pad_tensor_to_len(gamevars, padded_len)
+        goal = pad_tensor_to_len(goal, padded_len)
+        actions = pad_tensor_to_len(actions, padded_len)
+        last_actions = pad_tensor_to_len(last_actions, padded_len)
+        targets = pad_tensor_to_len(targets, padded_len)
+        padding_mask = pad_tensor_to_len(tf.ones(original_len,dtype=tf.float32),padded_len)
+    
+    train_func(screen_buf,gamevars,goal,actions,last_actions,targets,padding_mask)
 
 epsilon_func = lambda step: (0.02 + 145000. / (float(step) + 150000.))
 
 #one step of the network
 #returns the action chosen
-def one_step(game, last_action, epsilon=None, in_recurrent=None, goal=None, episode_memory2=None):
+def one_step(game, last_action, epsilon=None, in_recurrent=None, goal=None, episode_memory=None):
     state = game.get_state()
 
     screen_buf = state.screen_buffer
@@ -493,8 +519,8 @@ def one_step(game, last_action, epsilon=None, in_recurrent=None, goal=None, epis
             else:
                 print("Random choice type",repr(RANDOM_CHOICE_TYPE),"not supported.")
 
-    if episode_memory2 is not None:
-        episode_memory2.add(screen_buf,gamevars,goal,chosen_action,last_action)
+    if episode_memory is not None:
+        episode_memory.add(screen_buf,gamevars,goal,chosen_action,last_action)
 
     action_vector = action_list.number_to_vector(chosen_action)
     
@@ -508,52 +534,49 @@ startstate = states
 starttime = time.time()
 
 def game_thread(game):
-    if game.game.is_episode_finished():
-        game.episode_done = True
-        return
-
-    epsilon = epsilon_func(states+game.episode_length)
-    _, game.last_action,game.recurrent_state = one_step(game.game,game.last_action,epsilon,game.recurrent_state,goal=game.goal,episode_memory2 = game.episode_memory2)
-    game.episode_length += 1
+    game.new_episode() #sets episode_done to False
     
-    if game.game.is_player_dead():
-        game.episode_done = True
-        return
-    if not game.episode_done:
-        game.game.advance_action(FRAMESKIP)
+    while True:
+        if game.game.is_episode_finished():
+            break
+
+        epsilon = epsilon_func(states+game.episode_length)
+        _, game.last_action,game.recurrent_state = one_step(game.game,game.last_action,epsilon,game.recurrent_state,goal=game.goal,episode_memory = game.episode_memory)
+        game.episode_length += 1
+        
+        if game.game.is_player_dead():
+            break
+        if not game.episode_done:
+            game.game.advance_action(FRAMESKIP)
+
+    player_died = game.game.is_player_dead()
+    game.episode_memory.make_targets(player_died)
+    game.episode_done = True
+    
+for game in games:
+    game.new_episode()
+    game.thread_obj = threading.Thread(target=game_thread, args=(game,))
+    game.thread_obj.start()
     
 while True:
-    for game in games:
-        game.new_episode()
+    time.sleep(0.2)
 
-    while True:
-        all_done = np.all([game.episode_done for game in games])
-        if all_done:
-            break
-    
-        #disable threading for debugging purposes
-        with concurrent.futures.ThreadPoolExecutor(max_workers=N_VIZDOOM_INSTANCES) as executor:
-             executor.map(game_thread, games)
-        #and do this instead
-        """for game in games:
-            game_thread(game)"""
-        
-        
-    gameid=0
     for game in games:
-        assert(game.episode_length == game.episode_memory2.current_size)
+        if not game.episode_done:
+            continue
+            
+        assert(game.episode_length == game.episode_memory.current_size)
         states += game.episode_length
         added_states += game.episode_length
         test_state_counter += game.episode_length
 
-        player_died = game.game.is_player_dead()
+        memories.add_episode(game.episode_memory)
+
+        #launch new thread now that we took the memories from the previous run
+        game.episode_done = False #let's do this explicitly anyway even tho it's implied by other code
+        game.thread_obj = threading.Thread(target=game_thread, args=(game,))
+        game.thread_obj.start()
         
-        tgt2 = game.episode_memory2.make_targets(player_died)
-        
-        memories.add_episode(game.episode_memory2, tgt2)
-        
-        gameid += 1
-    
         #train with memories
         if TRAINING_TYPE == TrainingType.EXPERIENCE_REPLAY:
             while added_states >= BATCH_SIZE:
@@ -566,29 +589,39 @@ while True:
             memories.clear()
         else:
             print("Training type",repr(TRAINING_TYPE),"not supported")
+            
         
     if test_state_counter >= TEST_FREQUENCY:
         test_state_counter -= TEST_FREQUENCY
-        """game = games[0] #test with the first instance
-        game.new_episode()
-        while not game.game.is_episode_finished():
-            game_state, game.last_action, _ = one_step(game.game, game.last_action, goal=game.goal)
         
-            game.episode_length += 1
-            if game.game.is_player_dead():
-                break
+        game = testgame
+        
+        #game.thread_obj = threading.Thread(target=test_thread, args=(game,))
+        #game.thread_obj.start()
+        
+        if DO_TESTING:
+            game.new_episode()
+            while not game.game.is_episode_finished():
+                game_state, game.last_action, game.recurrent_state = one_step(game.game, game.last_action, goal=game.goal, in_recurrent=game.recurrent_state)
+            
+                game.episode_length += 1
+                if game.game.is_player_dead():
+                    break
 
-            game.game.advance_action(FRAMESKIP)
-        print(states, "steps seen,", [x(game.game, game_state) for x in MEAS],", survived for", game.episode_length, "steps,", (states-startstate)*1./(time.time()-starttime)," steps/s")"""
-        
-        print(states, "steps seen,", (states-startstate)*1./(time.time()-starttime)," steps/s")
+                game.game.advance_action(FRAMESKIP)
+            print(states, "steps seen,", [x(game.game, game_state) for x in MEAS],", survived for", game.episode_length, "steps,", (states-startstate)*1./(time.time()-starttime)," steps/s")
+
+            with open("training_"+sys.argv[1]+".log.txt","a") as file:
+                file.write("{0} {1} {2}\n".format(states, [x(game.game, game_state) for x in MEAS], game.episode_length))
+        else:
+            print(states, "steps seen,", (states-startstate)*1./(time.time()-starttime)," steps/s")
         
         startstate = states
         starttime = time.time()
-        """with open("training_"+sys.argv[1]+".log.txt","a") as file:
-           file.write("{0} {1} {2}\n".format(states, [x(game.game, game_state) for x in MEAS], game.episode_length))"""
-           
         #TODO: implement model saving!
+
+        #checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=dm)
+        #checkpoint.save(file_prefix=sys.argv[1]+"/doomckpt")
 
 
 game.game.close()
