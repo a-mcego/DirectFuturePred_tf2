@@ -31,20 +31,11 @@ PREDICT_ONLY_DELTAS = True
 #RANDOM_CHOICE_TYPE = RandomChoiceType.UNIFORM
 RANDOM_CHOICE_TYPE = RandomChoiceType.SOFTMAX
 
-#TRAINING_TYPE = TrainingType.EXPERIENCE_REPLAY
-#TRAINING_TYPE = TrainingType.FULL_EPISODES
-TRAINING_TYPE = TrainingType.FULL_EPISODES_RECURRENT
+TRAINING_TYPE = TrainingType.FULL_EPISODES_LSTM
 
 FRAMESKIP = 4
 BATCH_SIZE = 64 #how many steps in one batch of training the network
-MEMORY_SIZE = 4000 #how many steps we keep in the experience memory
-                   #only for TrainingType.EXPERIENCE_REPLAY!
 TEST_FREQUENCY = 10000 #how often we test the network, in steps trained
-
-#what do we do when the experience memory is full?
-#only for TrainingType.EXPERIENCE_REPLAY!
-#MEMORY_FULL_STRATEGY = MemoryFullStrategy.DELETE_OLDEST
-MEMORY_FULL_STRATEGY = MemoryFullStrategy.DELETE_EVERY_OTHER
 
 #having goal as an input to the network seems to be unnecessary.
 #here's a way to turn it off! :)
@@ -96,7 +87,7 @@ class Episode:
         self.chosen_action = np.zeros(shape=(size),dtype=np.int32)
         self.last_action = np.zeros(shape=(size),dtype=np.int32)
         
-        self.targets = np.zeros(shape=(EPISODE_LENGTH//FRAMESKIP+1,N_GOAL_TIMES,N_MEASUREMENTS),dtype=np.float32)
+        self.targets = np.zeros(shape=(size,N_GOAL_TIMES,N_MEASUREMENTS),dtype=np.float32)
         
         self.gt = np.asarray(GOAL_TIMES,dtype=np.int32) #used in self.make_targets()
     
@@ -132,9 +123,15 @@ class Episode:
     def get_targets(self):
         return self.targets[:self.current_size]
 
-    #pad the current data with zeros, in the timesteps [current_size,n)
-    def pad(self, n):
-        pass#TODO
+    def get_all_memories(self):
+        padded_size = get_padded_length(self.current_size)
+        screen_buf = self.screen_buf[:padded_size]
+        gamevars = self.gamevars[:padded_size]
+        goal = self.goal[:padded_size]
+        chosen_action = self.chosen_action[:padded_size]
+        last_action = self.last_action[:padded_size]
+        targets = self.targets[:padded_size]
+        return (screen_buf, gamevars, goal, chosen_action, last_action, targets), self.current_size
 
 class DoomGame:
     def new_episode(self):
@@ -206,7 +203,7 @@ class DoomGame:
         game.set_mode(mode)
         game.init()
         self.game = game
-        self.episode_memory = Episode(EPISODE_LENGTH//FRAMESKIP+1)
+        self.episode_memory = Episode(size=get_padded_length(EPISODE_LENGTH//FRAMESKIP+1))
     
 class DoomModel(tf.keras.Model):
     def __init__(self, filename):
@@ -232,7 +229,7 @@ class DoomModel(tf.keras.Model):
         if USE_LAST_ACTION_INPUT:
             self.last_action = tf.keras.layers.Embedding(action_list.total, 128)
         
-        if TRAINING_TYPE == TrainingType.FULL_EPISODES_RECURRENT:
+        if TRAINING_TYPE == TrainingType.FULL_EPISODES_LSTM:
             self.lstm1 = tf.keras.layers.LSTM(512,return_sequences=True,return_state=True)
             self.lstm1.could_use_cudnn = False
 
@@ -272,12 +269,10 @@ class DoomModel(tf.keras.Model):
         
         concated = tf.concat(concated,axis=-1)
         
-        if TRAINING_TYPE == TrainingType.FULL_EPISODES_RECURRENT:
+        if TRAINING_TYPE == TrainingType.FULL_EPISODES_LSTM:
             concated = self.lstm1(tf.expand_dims(concated,axis=0), initial_state=in_state)
             ret_state = concated[1:]
             concated = tf.squeeze(concated[0],axis=0)
-        else:
-            ret_state = None
 
         acts = self.action1(concated)
         acts = self.action2(acts)
@@ -298,95 +293,10 @@ class DoomModel(tf.keras.Model):
 
         return total,ret_state
 
-class Memories:
-    def __init__(self, size):
-        print("Init Memory size",size)
-        self.total_size = size
-        self.current_size = 0
-        self.screen_buf = np.zeros(shape=(size,SCALED_RESOLUTION[1],SCALED_RESOLUTION[0],N_INPUT_FEATURE_MAPS),dtype=np.float32)
-        self.gamevars = np.zeros(shape=(size,N_MEASUREMENTS),dtype=np.float32)
-        self.goal = np.zeros(shape=(size,N_MEASUREMENTS,N_GOAL_TIMES),dtype=np.float32)
-        self.chosen_action = np.zeros(shape=(size),dtype=np.int32)
-        self.last_action = np.zeros(shape=(size),dtype=np.int32)
-        
-        self.targets = np.zeros(shape=(size,N_GOAL_TIMES,N_MEASUREMENTS),dtype=np.float32)
-        
-    def clear(self):
-        self.current_size = 0
-        
-    def crop(self, tensor, crop_start,oldsize):
-        cropped_tensor = tensor[crop_start:oldsize]
-        cropped_size = cropped_tensor.shape[0]
-        tensor[:cropped_size] = cropped_tensor
-        self.current_size = cropped_size
-        
-    def take_every_other(self, tensor, oldsize):
-        cropped_tensor = tensor[:oldsize:2]
-        cropped_size = cropped_tensor.shape[0]
-        tensor[:cropped_size] = cropped_tensor
-        self.current_size = cropped_size
-        
-    def append(self, tensor, moredata, moredata_len):
-        #TODO: should we copy this? probably.
-        tensor[self.current_size:self.current_size+moredata_len] = np.array(moredata[:moredata_len],copy=True)
-
-    def add_episode(self, episode):
-        newsize = self.current_size+episode.current_size
-    
-        if newsize > self.total_size:
-            oldsize = self.current_size
-            if MEMORY_FULL_STRATEGY == MemoryFullStrategy.DELETE_OLDEST:
-                crop_start = newsize - self.total_size
-                self.crop(self.screen_buf,crop_start,oldsize)
-                self.crop(self.gamevars,crop_start,oldsize)
-                self.crop(self.goal,crop_start,oldsize)
-                self.crop(self.chosen_action,crop_start,oldsize)
-                self.crop(self.last_action,crop_start,oldsize)
-                self.crop(self.targets,crop_start,oldsize)
-            elif MEMORY_FULL_STRATEGY == MemoryFullStrategy.DELETE_EVERY_OTHER:
-                self.take_every_other(self.screen_buf,oldsize)
-                self.take_every_other(self.gamevars,oldsize)
-                self.take_every_other(self.goal,oldsize)
-                self.take_every_other(self.chosen_action,oldsize)
-                self.take_every_other(self.last_action,oldsize)
-                self.take_every_other(self.targets,oldsize)
-            else:
-                print("MemoryFullStrategy",repr(MEMORY_FULL_STRATEGY),"not supported.")
-                
-        #hack: there is an assumption here that after the memory full strategy
-        #      has been executed, there *definitely is* room for the new memories
-        
-        self.append(self.screen_buf, episode.screen_buf, episode.current_size)
-        self.append(self.gamevars, episode.gamevars, episode.current_size)
-        self.append(self.goal, episode.goal, episode.current_size)
-        self.append(self.chosen_action, episode.chosen_action, episode.current_size)
-        self.append(self.last_action, episode.last_action, episode.current_size)
-        self.append(self.targets, episode.targets, episode.current_size)
-        self.current_size += episode.current_size
-
-    def get_random_memories(self, n):
-        indices = np.random.randint(self.current_size, size=(BATCH_SIZE))
-        screen_buf = self.screen_buf[indices]
-        gamevars = self.gamevars[indices]
-        goal = self.goal[indices]
-        chosen_action = self.chosen_action[indices]
-        last_action = self.last_action[indices]
-        targets = self.targets[indices]
-        return screen_buf, gamevars, goal, chosen_action, last_action, targets
-        
-    def get_all_memories(self):
-        screen_buf = self.screen_buf[:self.current_size]
-        gamevars = self.gamevars[:self.current_size]
-        goal = self.goal[:self.current_size]
-        chosen_action = self.chosen_action[:self.current_size]
-        last_action = self.last_action[:self.current_size]
-        targets = self.targets[:self.current_size]
-        return screen_buf, gamevars, goal, chosen_action, last_action, targets
-        
 dm = DoomModel(sys.argv[1])
 #TODO: implement model loading!
 
-memories = Memories(size=MEMORY_SIZE)
+memories = Episode(size=get_padded_length(EPISODE_LENGTH//FRAMESKIP+1))
 
 games = [DoomGame(vzd.Mode.PLAYER,False) for _ in range(N_VIZDOOM_INSTANCES)]
 
@@ -398,10 +308,7 @@ optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4, beta_1=0.95, beta_2=0.9
 @tf.function
 def train_func(screen_buf,gamevars,goal,actions,last_actions,targets,padding_mask):
     with tf.GradientTape() as tape:
-        if padding_mask is None:
-            out,_ = dm(screen_buf,gamevars,goal,last_actions)
-        else:
-            out,_ = dm(screen_buf,gamevars,goal,last_actions,tf.cast(padding_mask,tf.bool))
+        out,_ = dm(screen_buf,gamevars,goal,last_actions,tf.cast(padding_mask,tf.bool))
         
         consec = tf.range(actions.shape[0])
         total = tf.stack([consec,actions],axis=-1)
@@ -410,20 +317,12 @@ def train_func(screen_buf,gamevars,goal,actions,last_actions,targets,padding_mas
         #hack: target less than -1 million means the target doesn't exist
         #      i tried using NaN for this but failed for whatever reason
         loss = tf.where(targets < -1000000.0,tf.zeros_like(out2),tf.square(targets-out2))
-        if padding_mask is not None:
-            loss = tf.multiply(loss,tf.reshape(padding_mask,[padding_mask.shape[0],1,1]))
+        loss = tf.multiply(loss,tf.reshape(padding_mask,[padding_mask.shape[0],1,1]))
     
     gradients = tape.gradient(loss, dm.trainable_variables)
     optimizer.apply_gradients(zip(gradients, dm.trainable_variables))
     
     return loss,out2
-
-def get_padded_length(n):
-    lengths = [150,200,300,400,600,800,1200,1600]
-    for l in lengths:
-        if l >= n:
-            return l
-    return n
 
 def pad_tensor_to_len(tensor, new_len):
     added_amount = new_len-tensor.shape[0]
@@ -433,7 +332,7 @@ def pad_tensor_to_len(tensor, new_len):
     pad = tf.zeros(shape=([added_amount]+tensor.shape[1:]),dtype=tensor.dtype)
     return tf.concat([tensor,pad],axis=0)
 
-def train(mems):
+def train(mems, actual_size):
     screen_buf = tf.convert_to_tensor(mems[0],dtype=tf.float32)
     gamevars = tf.convert_to_tensor(mems[1],dtype=tf.float32)
     goal = tf.convert_to_tensor(mems[2],dtype=tf.float32)
@@ -442,20 +341,9 @@ def train(mems):
     targets = tf.convert_to_tensor(mems[5],dtype=tf.float32)
     targets = tf.transpose(targets,perm=[0,2,1])
     
-    padding_mask = None
-    if TRAINING_TYPE == TrainingType.FULL_EPISODES or TRAINING_TYPE == TrainingType.FULL_EPISODES_RECURRENT:
-        original_len = actions.shape[0]
-        padded_len = get_padded_length(original_len)
-        
-        #this is ugly repetitive code, wonder if there's a better way
-        screen_buf = pad_tensor_to_len(screen_buf, padded_len)
-        gamevars = pad_tensor_to_len(gamevars, padded_len)
-        goal = pad_tensor_to_len(goal, padded_len)
-        actions = pad_tensor_to_len(actions, padded_len)
-        last_actions = pad_tensor_to_len(last_actions, padded_len)
-        targets = pad_tensor_to_len(targets, padded_len)
-        padding_mask = pad_tensor_to_len(tf.ones(original_len,dtype=tf.float32),padded_len)
-    
+    padded_len = get_padded_length(actual_size)
+    padding_mask = pad_tensor_to_len(tf.ones(actual_size,dtype=tf.float32),padded_len)
+
     train_func(screen_buf,gamevars,goal,actions,last_actions,targets,padding_mask)
 
 epsilon_func = lambda step: (0.02 + 145000. / (float(step) + 150000.))
@@ -467,7 +355,6 @@ def one_step(game, last_action, epsilon=None, in_recurrent=None, goal=None, epis
 
     screen_buf = state.screen_buffer
     screen_buf = cv2.resize(screen_buf, (SCALED_RESOLUTION[1],SCALED_RESOLUTION[0]))
-    screen_buf = tf.add(tf.multiply(tf.cast(screen_buf,tf.float32),1.0/255.0),-0.5)
     if COLORMODE == ColorMode.GRAYSCALE:
         screen_buf = tf.reshape(screen_buf,[1,screen_buf.shape[0],screen_buf.shape[1],1])
     elif COLORMODE == ColorMode.COLOR:
@@ -476,9 +363,10 @@ def one_step(game, last_action, epsilon=None, in_recurrent=None, goal=None, epis
     if USE_DEPTH_BUFFER:
         depth_buf = state.depth_buffer
         depth_buf = cv2.resize(depth_buf, (SCALED_RESOLUTION[1],SCALED_RESOLUTION[0]))
-        depth_buf = tf.add(tf.multiply(tf.cast(depth_buf,tf.float32),1.0/255.0),-0.5)
         depth_buf = tf.reshape(depth_buf,[1,depth_buf.shape[0],depth_buf.shape[1],1])
         screen_buf = tf.concat([screen_buf,depth_buf],axis=-1)
+
+    screen_buf = tf.add(tf.multiply(tf.cast(screen_buf,tf.float32),1.0/255.0),-0.5)
 
     if USE_LABELED_RECTS:
         canvas_buf = np.zeros([GAME_RESOLUTION[1],GAME_RESOLUTION[0]],dtype=np.float32)
@@ -566,30 +454,25 @@ while True:
             continue
             
         assert(game.episode_length == game.episode_memory.current_size)
-        states += game.episode_length
-        added_states += game.episode_length
-        test_state_counter += game.episode_length
 
-        memories.add_episode(game.episode_memory)
+        memories,game.episode_memory = game.episode_memory,memories
+
+        #memories.add_episode(game.episode_memory)
 
         #launch new thread now that we took the memories from the previous run
         game.episode_done = False #let's do this explicitly anyway even tho it's implied by other code
         game.thread_obj = threading.Thread(target=game_thread, args=(game,))
         game.thread_obj.start()
         
-        #train with memories
-        if TRAINING_TYPE == TrainingType.EXPERIENCE_REPLAY:
-            while added_states >= BATCH_SIZE:
-                random_mems = memories.get_random_memories(BATCH_SIZE)
-                train(random_mems)
-                added_states -= BATCH_SIZE
-        elif TRAINING_TYPE == TrainingType.FULL_EPISODES or TRAINING_TYPE == TrainingType.FULL_EPISODES_RECURRENT:
-            all_mems = memories.get_all_memories()
-            train(all_mems)
-            memories.clear()
-        else:
+        states += game.episode_length
+        added_states += game.episode_length
+        test_state_counter += game.episode_length
+
+        all_mems, actual_size = memories.get_all_memories()
+        train(all_mems,actual_size)
+
+        if TRAINING_TYPE != TrainingType.FULL_EPISODES_LSTM:
             print("Training type",repr(TRAINING_TYPE),"not supported")
-            
         
     if test_state_counter >= TEST_FREQUENCY:
         test_state_counter -= TEST_FREQUENCY

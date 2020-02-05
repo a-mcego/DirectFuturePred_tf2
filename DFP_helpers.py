@@ -7,9 +7,7 @@ class RandomChoiceType(Enum):
     SOFTMAX = 2
     
 class TrainingType(Enum):
-    EXPERIENCE_REPLAY = 1
-    FULL_EPISODES = 2
-    FULL_EPISODES_RECURRENT = 3
+    FULL_EPISODES_LSTM = 1
 
 class MemoryFullStrategy(Enum):
     DELETE_OLDEST = 1
@@ -117,3 +115,9 @@ class DeltaTracker:
     def last_delta(self):
         return self.delta
 
+def get_padded_length(n):
+    lengths = [150,200,300,400,600,800,1200,1600]
+    for l in lengths:
+        if l >= n:
+            return l
+    return n
